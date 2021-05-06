@@ -1,0 +1,14 @@
+---
+- name: test
+  hosts: all
+
+  tasks:
+    - name: Get the dist info
+      shell: "uname -a"
+      register: distinfo
+
+    - name: Some other op
+      shell: "ls -la"
+
+    - name: Display the dist info
+      debug: msg="{{ distinfo.stdout }}"
