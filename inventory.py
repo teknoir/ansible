@@ -50,9 +50,10 @@ class TeknoirInventory(object):
         }
         ssh_port = 2200
         for device in devices['items']:
-            path = f'inv/{context["name"]}/{device["metadata"]["namespace"]}/'
-            if device['metadata']['namespace'] not in inventory:
-                inventory[device['metadata']['namespace']] = {
+            ansible_group = device["metadata"]["namespace"].replace('-', '_')
+            path = f'inv/{context["name"]}/{ansible_group}/'
+            if ansible_group not in inventory:
+                inventory[ansible_group] = {
                     'hosts': [],
                     'vars': {}
                 }
@@ -63,8 +64,8 @@ class TeknoirInventory(object):
                     outfile.write(self.decode(device['spec']['keys']['data']['rsa_private']))
                 os.chmod(private_key_file, 0o400)
 
-            hostname = f'{device["metadata"]["namespace"]}-{device["metadata"]["name"]}'
-            inventory[device['metadata']['namespace']]['hosts'].append(hostname)
+            hostname = f'{ansible_group}-{device["metadata"]["name"]}'
+            inventory[ansible_group]['hosts'].append(hostname)
             inventory['_meta']['hostvars'][hostname] = {
                 'ansible_connection': 'teknoir',
                 'ansible_port': ssh_port,
@@ -78,7 +79,7 @@ class TeknoirInventory(object):
                 'ansible_python_interpreter': '/usr/bin/python3',
                 'ansible_ssh_retries': 20,
                 'ansible_kubectl_context': context,
-                'ansible_kubectl_namespace': device['metadata']['namespace'],
+                'ansible_kubectl_namespace': ansible_group,
                 'ansible_teknoir_tunnel_port': self.decode(device['spec']['keys']['data']['tunnel']),
                 'ansible_teknoir_device': device['metadata']['name']
             }
