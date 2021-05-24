@@ -7,8 +7,8 @@ The easiest way to start off is to copy content of this repo
 * As namespaces become groups, we do not support namespaces with dashes(-).
   * Dashes(-) will be replaced with underscores(_)
 * You have to set kubectl context before running ansible commands.
-* The Connection Plugin does not automatically enable tunnels for devices.
-    * Enable tunneling from the teknoir cloud console.
+* The Connection Plugin does only enable tunneling, adding the reverse tunnel.
+    * Clean up manually, disable tunneling from the teknoir cloud console.
 
 ## Inventory
 Creates an inventory so you are able to connect to any device in any namespace.
