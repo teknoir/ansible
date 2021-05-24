@@ -1,18 +1,16 @@
 from __future__ import (absolute_import, division, print_function)
 
+import base64
 import os
-import pipes
+import random
 import signal
 import subprocess
 import time
 
-from ansible.errors import AnsibleError
-from ansible.plugins.connection.ssh import Connection as SSHConnection
-from ansible.module_utils._text import to_text
-from ansible.plugins.loader import get_shell_plugin
-from contextlib import contextmanager
 from ansible.utils.display import Display
 from kubernetes import client, config
+
+from ansible.errors import AnsibleError
 
 __metaclass__ = type
 
@@ -355,11 +353,33 @@ display = Display()
 
 # HACK: Ansible core does classname-based validation checks, to ensure connection plugins inherit directly from a class
 # named "ConnectionBase". This intermediate class works around this limitation.
-class ConnectionBase(SSHConnection):
-    pass
+# class ConnectionBase(SSHConnection):
+#     pass
 
 
-class Connection(ConnectionBase):
+import functools
+import importlib.util
+import os
+import time
+
+def load_module(name, path):
+    module_spec = importlib.util.spec_from_file_location(
+        name, path
+    )
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
+
+# NOTICE(cloudnull): The connection plugin imported using the full path to the
+#                    file because the ssh connection plugin is not importable.
+import ansible.plugins.connection as conn
+SSH = load_module(
+    'ssh',
+    os.path.join(os.path.dirname(conn.__file__), 'ssh.py')
+)
+
+# class Connection(ConnectionBase):
+class Connection(SSH.Connection):
     ''' ssh based connections '''
 
     transport = 'teknoir'
@@ -367,37 +387,85 @@ class Connection(ConnectionBase):
     def __init__(self, *args, **kwargs):
         super(Connection, self).__init__(*args, **kwargs)
         self.portforward_subprocess = None
+        self.tunnel_opened = False
+        self.inventory = 'teknoir'
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self.portforward_subprocess:
-            device_name = self.get_option('teknoir_device')
-            namespace = self.get_option('kubectl_namespace')
-            display.v(f"Killing port-forwarding", host=f'{namespace}-{device_name}')
+        display.v(f"(exit)", host=self.inventory)
+        if self.portforward_subprocess is not None:
+            display.v(f"Killing port-forwarding (exit)", host=self.inventory)
             os.killpg(os.getpgid(self.portforward_subprocess.pid), signal.SIGTERM)
+            self.portforward_subprocess = None
+
+    def _start_reverse_tunnel(self, custom_api, namespace, name):
+        display.v(f"Start reverse tunnel", host=self.inventory)
+        port = str(random.randint(1024, 64511))
+        device_patch = {
+            "spec": {
+                "keys": {
+                    "data": {
+                        "tunnel": base64.b64encode(port.encode('utf-8')).decode('utf-8')
+                    }
+                }
+            }
+        }
+        custom_api.patch_namespaced_custom_object("kubeflow.org",
+                                                  "v1beta1",
+                                                  namespace,
+                                                  "devices",
+                                                  name,
+                                                  device_patch)
+        self.tunnel_opened = True
+        return port
+
+    def _stop_reverse_tunnel(self, custom_api, namespace, name):
+        display.v(f"Stop reverse tunnel", host=self.inventory)
+        device_patch = {
+            "spec": {
+                "keys": {
+                    "data": {
+                        "tunnel": base64.b64encode('NA'.encode('utf-8')).decode('utf-8')
+                    }
+                }
+            }
+        }
+        custom_api.patch_namespaced_custom_object("kubeflow.org",
+                                                  "v1beta1",
+                                                  namespace,
+                                                  "devices",
+                                                  name,
+                                                  device_patch)
 
     def _connect(self):
         device_name = self.get_option('teknoir_device')
         namespace = self.get_option('kubectl_namespace')
         tunnel_port = self.get_option('teknoir_tunnel_port')
+        ansible_group = namespace.replace('-', '_')
+        self.inventory = f'{ansible_group}-{device_name}'
 
-        # TODO: check tunnelport is a port, if not patch the device
-        # re = '^[0-9]+$'
-        # if ![[$tunnelport =~ $re]]; then
         context = config.list_kube_config_contexts()[1]
-        # config.load_kube_config()
+        config.load_kube_config()
+        custom_api = client.CustomObjectsApi()
+
+        if not tunnel_port.isdigit():
+            tunnel_port = self._start_reverse_tunnel(custom_api, namespace, device_name)
+            self.set_option('teknoir_tunnel_port', tunnel_port)
 
         if self.portforward_subprocess is None:
-            display.v("Start port-forward to deadend pod", host=f'{namespace}-{device_name}')
+            display.v("Start port-forward to deadend pod", host=self.inventory)
             cmd = f'kubectl --context={context["name"]} --namespace=deadend port-forward pod/deadend-0 {self.port}:{tunnel_port}'
-            self.portforward_subprocess = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+            self.portforward_subprocess = subprocess.Popen(cmd,
+                                                           shell=True,
+                                                           stdout=subprocess.PIPE,
+                                                           stderr=subprocess.PIPE,
                                                            preexec_fn=os.setsid)
-            # time.sleep(20)
-            not_forever = 30
+
+            not_forever = 20
             while True:
-                display.v(f"Waiting for port-forward or reverse tunnel", host=f'{namespace}-{device_name}')
+                display.v(f"Waiting for port-forward ({20-not_forever}/20)", host=self.inventory)
                 time.sleep(2)
                 if self.portforward_subprocess.poll() is not None:
-                    display.v(f"Port-forward did not start correctly", host=f'{namespace}-{device_name}')
+                    display.v(f"Port-forward did not start correctly", host=self.inventory)
                     self.portforward_subprocess = None
                     break
                 elif not_forever <= 0:
@@ -405,18 +473,35 @@ class Connection(ConnectionBase):
                 else:
                     nextline = self.portforward_subprocess.stdout.readline()
                     if b'Forwarding from' in nextline:
-                        display.v(f"Port-forwarding is up and running", host=f'{namespace}-{device_name}')
+                        display.v(f"Port-forwarding is up and running", host=self.inventory)
                         break
-                --not_forever
+                not_forever -= 1
+
+            not_forever = 300
+            while True:
+                display.v(f"Waiting for reverse tunnel ({300-not_forever}/300)", host=self.inventory)
+                returncode = not_forever
+                try:
+                    cmd = SSH.shlex_quote('exit')
+                    (returncode, _, _) = super(Connection, self).exec_command(cmd, None, sudoable=False)
+                except AnsibleError as e:
+                    pass
+
+                if returncode == 0:
+                    display.v(f"Reverse tunnel is up and running", host=self.inventory)
+                    break
+                elif not_forever <= 0:
+                        break
+
+                not_forever -= 1
+                time.sleep(2)
 
         return self
 
     def close(self):
         """Terminate the connection"""
-        if self.portforward_subprocess:
-            device_name = self.get_option('teknoir_device')
-            namespace = self.get_option('kubectl_namespace')
-            display.v(f"Killing port-forwarding", host=f'{namespace}-{device_name}')
+        if self.portforward_subprocess is not None:
+            display.v(f"Killing port-forwarding (close)", host=self.inventory)
             os.killpg(os.getpgid(self.portforward_subprocess.pid), signal.SIGTERM)
             self.portforward_subprocess = None
         pass

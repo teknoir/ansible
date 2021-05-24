@@ -79,7 +79,7 @@ class TeknoirInventory(object):
                 'ansible_python_interpreter': '/usr/bin/python3',
                 'ansible_ssh_retries': 20,
                 'ansible_kubectl_context': context,
-                'ansible_kubectl_namespace': ansible_group,
+                'ansible_kubectl_namespace': device["metadata"]["namespace"],
                 'ansible_teknoir_tunnel_port': self.decode(device['spec']['keys']['data']['tunnel']),
                 'ansible_teknoir_device': device['metadata']['name']
             }
