@@ -5,6 +5,7 @@ import sys
 import argparse
 import json
 import base64
+import random
 from kubernetes import client, config
 from kubernetes.config import ConfigException
 
@@ -36,7 +37,6 @@ class TeknoirInventory(object):
         return base64.b64decode(s.encode('utf-8')).decode('utf-8')
 
     def teknoir_inventory(self):
-        context = config.list_kube_config_contexts()[1]
         config.load_kube_config()
         custom_api = client.CustomObjectsApi()
         devices = custom_api.list_cluster_custom_object(group="kubeflow.org",
@@ -48,27 +48,47 @@ class TeknoirInventory(object):
                 'hostvars': {}
             }
         }
-        ssh_port = 2200
+
         for device in devices['items']:
             ansible_group = device["metadata"]["namespace"].replace('-', '_')
-            path = f'inv/{context["name"]}/{ansible_group}/'
+            path = f'inv/{ansible_group}/'
+            hostname = f'{device["metadata"]["name"]}'
+
             if ansible_group not in inventory:
                 inventory[ansible_group] = {
                     'hosts': [],
                     'vars': {}
                 }
                 os.makedirs(path, exist_ok=True)
+            inventory[ansible_group]['hosts'].append(hostname)
+
+            for label, value in device["metadata"]["labels"].items():
+                label = label.replace('-', '_')
+                value = value.replace('-', '_')
+                additional_group = f'{label}_{value}'
+                if additional_group not in inventory:
+                    inventory[additional_group] = {
+                        'hosts': [],
+                        'vars': {}
+                    }
+                inventory[additional_group]['hosts'].append(hostname)
+
             private_key_file = f'{path}{device["metadata"]["name"]}.pem'
             if not os.path.isfile(private_key_file):
                 with open(private_key_file, 'w') as outfile:
                     outfile.write(self.decode(device['spec']['keys']['data']['rsa_private']))
                 os.chmod(private_key_file, 0o400)
 
-            hostname = f'{ansible_group}-{device["metadata"]["name"]}'
-            inventory[ansible_group]['hosts'].append(hostname)
+            tunnel_opened = True
+            tunnel_port = self.decode(device['spec']['keys']['data']['tunnel'])
+            if not tunnel_port.isdigit():
+                tunnel_port = str(random.randint(1024, 64511))
+                tunnel_opened = False
+
+
             inventory['_meta']['hostvars'][hostname] = {
                 'ansible_connection': 'teknoir',
-                'ansible_port': ssh_port,
+                'ansible_port': tunnel_port,
                 'ansible_host': 'localhost',
                 'ansible_user': self.decode(device['spec']['keys']['data']['username']),
                 'ansible_sudo_pass': self.decode(device['spec']['keys']['data']['userpassword']),
@@ -78,12 +98,11 @@ class TeknoirInventory(object):
                 'ansible_ssh_private_key_file': private_key_file,
                 'ansible_python_interpreter': '/usr/bin/python3',
                 'ansible_ssh_retries': 20,
-                'ansible_kubectl_context': context,
                 'ansible_kubectl_namespace': device["metadata"]["namespace"],
-                'ansible_teknoir_tunnel_port': self.decode(device['spec']['keys']['data']['tunnel']),
+                'ansible_teknoir_tunnel_port': tunnel_port,
+                'ansible_teknoir_tunnel_open': tunnel_opened,
                 'ansible_teknoir_device': device['metadata']['name']
             }
-            ssh_port = ssh_port + 1
         return inventory
 
     # Empty inventory for testing.

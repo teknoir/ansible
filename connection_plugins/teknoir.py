@@ -55,7 +55,9 @@ DOCUMENTATION = '''
               - name: ansible_ssh_pass
               - name: ansible_ssh_password
       sshpass_prompt:
-          description: Password prompt that sshpass should search for. Supported by sshpass 1.06 and up.
+          description:
+              - Password prompt that sshpass should search for. Supported by sshpass 1.06 and up.
+              - Defaults to ``Enter PIN for`` when pkcs11_provider is set.
           default: ''
           ini:
               - section: 'ssh_connection'
@@ -166,7 +168,7 @@ DOCUMENTATION = '''
               version_added: '2.7'
           cli:
             - name: ssh_extra_args
-      retries:
+      reconnection_retries:
           description: Number of attempts to connect.
           default: 3
           type: integer
@@ -321,6 +323,17 @@ DOCUMENTATION = '''
         cli:
           - name: timeout
         type: integer
+      pkcs11_provider:
+        version_added: '2.12'
+        default: ""
+        description:
+          - "PKCS11 SmartCard provider such as opensc, example: /usr/local/lib/opensc-pkcs11.so"
+          - Requires sshpass version 1.06+, sshpass must support the -P option
+        env: [{name: ANSIBLE_PKCS11_PROVIDER}]
+        ini:
+          - {key: pkcs11_provider, section: ssh_connection}
+        vars:
+          - name: ansible_ssh_pkcs11_provider
       kubectl_namespace:
         description:
           - The namespace with teknoir devices
@@ -335,6 +348,13 @@ DOCUMENTATION = '''
         vars:
           - name: ansible_teknoir_tunnel_port
           - name: delegated_vars['ansible_teknoir_tunnel_port']
+      teknoir_tunnel_open:
+        description:
+          - Indicates if the device has been instructed to create a reverse tunnel or not
+        type: bool
+        vars:
+          - name: ansible_teknoir_tunnel_open
+          - name: delegated_vars['ansible_teknoir_tunnel_open']
       teknoir_device:
         description:
           - The name of the device
@@ -383,23 +403,21 @@ class Connection(SSH.Connection):
     ''' ssh based connections '''
 
     transport = 'teknoir'
+    portforward_subprocess = None
 
     def __init__(self, *args, **kwargs):
         super(Connection, self).__init__(*args, **kwargs)
-        self.portforward_subprocess = None
-        self.tunnel_opened = False
         self.inventory = 'teknoir'
 
     def __exit__(self, exc_type, exc_value, traceback):
         display.v(f"(exit)", host=self.inventory)
-        if self.portforward_subprocess is not None:
+        if Connection.portforward_subprocess is not None:
             display.v(f"Killing port-forwarding (exit)", host=self.inventory)
-            os.killpg(os.getpgid(self.portforward_subprocess.pid), signal.SIGTERM)
-            self.portforward_subprocess = None
+            os.killpg(os.getpgid(Connection.portforward_subprocess.pid), signal.SIGTERM)
+            Connection.portforward_subprocess = None
 
-    def _start_reverse_tunnel(self, custom_api, namespace, name):
+    def _start_reverse_tunnel(self, custom_api, namespace, name, port):
         display.v(f"Start reverse tunnel", host=self.inventory)
-        port = str(random.randint(1024, 64511))
         device_patch = {
             "spec": {
                 "keys": {
@@ -415,8 +433,6 @@ class Connection(SSH.Connection):
                                                   "devices",
                                                   name,
                                                   device_patch)
-        self.tunnel_opened = True
-        return port
 
     def _stop_reverse_tunnel(self, custom_api, namespace, name):
         display.v(f"Stop reverse tunnel", host=self.inventory)
@@ -439,22 +455,22 @@ class Connection(SSH.Connection):
     def _connect(self):
         device_name = self.get_option('teknoir_device')
         namespace = self.get_option('kubectl_namespace')
+        tunnel_open = self.get_option('teknoir_tunnel_open')
         tunnel_port = self.get_option('teknoir_tunnel_port')
         ansible_group = namespace.replace('-', '_')
         self.inventory = f'{ansible_group}-{device_name}'
 
-        context = config.list_kube_config_contexts()[1]
         config.load_kube_config()
         custom_api = client.CustomObjectsApi()
 
-        if not tunnel_port.isdigit():
-            tunnel_port = self._start_reverse_tunnel(custom_api, namespace, device_name)
-            self.set_option('teknoir_tunnel_port', tunnel_port)
+        if not tunnel_open:
+            self._start_reverse_tunnel(custom_api, namespace, device_name, tunnel_port)
 
-        if self.portforward_subprocess is None:
+        if Connection.portforward_subprocess is None:
             display.v("Start port-forward to deadend pod", host=self.inventory)
-            cmd = f'kubectl --context={context["name"]} --namespace=deadend port-forward pod/deadend-0 {self.port}:{tunnel_port}'
-            self.portforward_subprocess = subprocess.Popen(cmd,
+            cmd = 'kubectl --namespace=teknoir port-forward svc/deadendproxy 8118:8118'
+            display.vvv(cmd, host=self.inventory)
+            Connection.portforward_subprocess = subprocess.Popen(cmd,
                                                            shell=True,
                                                            stdout=subprocess.PIPE,
                                                            stderr=subprocess.PIPE,
@@ -464,14 +480,14 @@ class Connection(SSH.Connection):
             while True:
                 display.v(f"Waiting for port-forward ({20-not_forever}/20)", host=self.inventory)
                 time.sleep(2)
-                if self.portforward_subprocess.poll() is not None:
+                if Connection.portforward_subprocess.poll() is not None:
                     display.v(f"Port-forward did not start correctly", host=self.inventory)
-                    self.portforward_subprocess = None
+                    Connection.portforward_subprocess = None
                     break
                 elif not_forever <= 0:
                     break
                 else:
-                    nextline = self.portforward_subprocess.stdout.readline()
+                    nextline = Connection.portforward_subprocess.stdout.readline()
                     if b'Forwarding from' in nextline:
                         display.v(f"Port-forwarding is up and running", host=self.inventory)
                         break
@@ -500,8 +516,8 @@ class Connection(SSH.Connection):
 
     def close(self):
         """Terminate the connection"""
-        if self.portforward_subprocess is not None:
+        if Connection.portforward_subprocess is not None:
             display.v(f"Killing port-forwarding (close)", host=self.inventory)
-            os.killpg(os.getpgid(self.portforward_subprocess.pid), signal.SIGTERM)
-            self.portforward_subprocess = None
+            os.killpg(os.getpgid(Connection.portforward_subprocess.pid), signal.SIGTERM)
+            Connection.portforward_subprocess = None
         pass
