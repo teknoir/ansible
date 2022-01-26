@@ -41,7 +41,7 @@ ansible-playbook -v -i inventory.py test-playbook.yaml --limit <device_name>
 ansible-playbook -v -i inventory.py test-playbook.yaml --limit <namespace>
 ```
 
-### Run for all devices in a namespace:
+### Run for all devices with label:
 ```bash
-ansible-playbook -v -i inventory.py test-playbook.yaml --limit <namespace>
+ansible-playbook -v -i inventory.py test-playbook.yaml --limit <label>
 ```
