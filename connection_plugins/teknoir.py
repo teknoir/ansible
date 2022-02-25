@@ -453,6 +453,7 @@ class Connection(SSH.Connection):
                                                   device_patch)
 
     def _connect(self):
+        super(Connection, self)._connect()
         device_name = self.get_option('teknoir_device')
         namespace = self.get_option('kubectl_namespace')
         tunnel_open = self.get_option('teknoir_tunnel_open')

@@ -3,6 +3,19 @@
   hosts: all
 
   tasks:
+    - name: Ensure tmp ansible dir
+      ansible.builtin.file:
+        path: /tmp/ansible
+        state: directory
+        mode: 777
+
+    - name: Copy ansible dir
+      rsync:
+        src: .
+        dest: /tmp/ansible/
+        recursive: yes
+        delete: yes
+
     - name: Get the dist info
       shell: "uname -a"
       register: distinfo

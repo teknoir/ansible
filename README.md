@@ -45,3 +45,6 @@ ansible-playbook -v -i inventory.py test-playbook.yaml --limit <namespace>
 ```bash
 ansible-playbook -v -i inventory.py test-playbook.yaml --limit <label>
 ```
+
+# Not working
+ansible.posix.syncronize does not work, use our custom rsync plugin (beta) instead
