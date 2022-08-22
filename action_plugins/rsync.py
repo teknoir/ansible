@@ -154,7 +154,7 @@ class ActionModule(ActionBase):
 
         if ActionModule.portforward_subprocess is None:
             display.v("Start port-forward to deadend pod", host=self.inventory)
-            cmd = 'kubectl --namespace=teknoir port-forward svc/deadendproxy 8228:8118'
+            cmd = 'kubectl --namespace=deadend-system port-forward svc/deadendproxy 8228:8118'
             display.vvv(cmd, host=self.inventory)
             ActionModule.portforward_subprocess = subprocess.Popen(cmd,
                                                            shell=True,

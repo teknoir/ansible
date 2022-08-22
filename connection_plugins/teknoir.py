@@ -469,7 +469,7 @@ class Connection(SSH.Connection):
 
         if Connection.portforward_subprocess is None:
             display.v("Start port-forward to deadend pod", host=self.inventory)
-            cmd = 'kubectl --namespace=teknoir port-forward svc/deadendproxy 8118:8118'
+            cmd = 'kubectl --namespace=deadend-system port-forward svc/deadendproxy 8118:8118'
             display.vvv(cmd, host=self.inventory)
             Connection.portforward_subprocess = subprocess.Popen(cmd,
                                                            shell=True,
