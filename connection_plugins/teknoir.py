@@ -6,6 +6,7 @@ import random
 import signal
 import subprocess
 import time
+from ansible.module_utils.six.moves import shlex_quote
 
 from ansible.utils.display import Display
 from kubernetes import client, config
@@ -499,7 +500,7 @@ class Connection(SSH.Connection):
                 display.v(f"Waiting for reverse tunnel ({300-not_forever}/300)", host=self.inventory)
                 returncode = not_forever
                 try:
-                    cmd = SSH.shlex_quote('exit')
+                    cmd = shlex_quote('exit')
                     (returncode, _, _) = super(Connection, self).exec_command(cmd, None, sudoable=False)
                 except AnsibleError as e:
                     pass
