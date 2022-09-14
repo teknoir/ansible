@@ -46,15 +46,18 @@ install_teknoir_ansible() {
   cp -rf connection_plugins/* ${HOME}/.ansible/plugins/connection/
 }
 
+if [ ${TEKNOIR_FRONTEND} == 'noninteractive' ]; then
+  install_teknoir_ansible
+else
+  warn "Do you want to setup Teknoir Ansible addons for \"${USER}\" in \"${HOME}/.ansible\"? [yY]"
+  read REPLY
 
-warn "Do you want to setup Teknoir Ansible addons for \"${USER}\" in \"${HOME}/.ansible\"? [yY]"
-read REPLY
-
-case ${REPLY} in
-  [Yy]* )
-    install_teknoir_ansible
-    ;;
-  * )
-    info "Skipping setup"
-    ;;
-esac
+  case ${REPLY} in
+    [Yy]* )
+      install_teknoir_ansible
+      ;;
+    * )
+      info "Skipping setup"
+      ;;
+  esac
+fi
