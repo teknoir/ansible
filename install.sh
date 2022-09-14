@@ -1,5 +1,5 @@
 #!/bin/sh
-set -eo pipefail
+set -e
 #set -x
 
 # --- helper functions for logs ---
