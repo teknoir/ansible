@@ -18,13 +18,13 @@ fatal()
 }
 
 check_ansible() {
-  if ! command -v ansible &> /dev/null; then
+  if [ ! command -v ansible &> /dev/null ]; then
       fatal "Ansible could not be found, please install with ex. \"brew install ansible\" or \"pip install ansible\""
   fi
 }
 
 check_corkscrew() {
-  if ! command -v corkscrew &> /dev/null; then
+  if [ ! command -v corkscrew &> /dev/null ]; then
       fatal "Command corkscrew could not be found, please install with ex. \"brew install corkscrew\""
   fi
 }
