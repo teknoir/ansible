@@ -15,6 +15,16 @@
         dest: /tmp/ansible/
         recursive: yes
         delete: yes
+        rsync_opts:
+          - --include=action_plugins/
+          - --include=connection_plugins/
+          - --include=module_plugins/
+          - --include=*.yaml
+          - --include=*.cfg
+          - --include=*.sh
+          - --include=*.py
+          - --include=*.md
+          - --exclude=*
 
     - name: Get the dist info
       shell: "uname -a"

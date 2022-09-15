@@ -50,7 +50,7 @@ class TeknoirInventory(object):
         }
 
         for device in devices['items']:
-            ansible_group = device["metadata"]["namespace"].replace('-', '_')
+            ansible_group = device["metadata"]["namespace"].replace('-', '_').replace('.', '_')
             path = f'inv/{ansible_group}/'
             hostname = f'{device["metadata"]["name"]}'
 
@@ -63,8 +63,8 @@ class TeknoirInventory(object):
             inventory[ansible_group]['hosts'].append(hostname)
 
             for label, value in device["metadata"]["labels"].items():
-                label = label.replace('-', '_')
-                value = value.replace('-', '_')
+                label = label.replace('-', '_').replace('.', '_')
+                value = value.replace('-', '_').replace('.', '_')
                 additional_group = f'{label}_{value}'
                 if additional_group not in inventory:
                     inventory[additional_group] = {

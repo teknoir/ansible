@@ -447,7 +447,7 @@ class Connection(SSH.Connection):
         namespace = self.get_option('kubectl_namespace')
         tunnel_open = self.get_option('teknoir_tunnel_open')
         tunnel_port = self.get_option('teknoir_tunnel_port')
-        ansible_group = namespace.replace('-', '_')
+        ansible_group = namespace.replace('-', '_').replace('.', '_')
         self.inventory = f'{ansible_group}-{device_name}'
 
         config.load_kube_config()
