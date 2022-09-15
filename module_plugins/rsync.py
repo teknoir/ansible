@@ -538,7 +538,7 @@ def main():
             # Note:  The action plugin takes care of setting this to a port from
             # inventory if the user didn't specify an explicit dest_port
             if dest_port is not None:
-                ssh_cmd.extend(['-o', 'Port=%s' % dest_port, '-o', 'ProxyCommand corkscrew localhost 8228 %h %p'])
+                ssh_cmd.extend(['-o', 'Port=%s' % dest_port, '-o', 'ProxyCommand corkscrew localhost 8118 %h %p'])
             if not verify_host:
                 ssh_cmd.extend(['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null'])
             ssh_cmd_str = ' '.join(shlex_quote(arg) for arg in ssh_cmd)

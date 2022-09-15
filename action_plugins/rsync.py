@@ -3,9 +3,6 @@ from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
 import os.path
-import subprocess
-import time
-import signal
 from ansible import constants as C
 from ansible.module_utils.six import string_types
 from ansible.module_utils.six.moves import shlex_quote
@@ -15,8 +12,6 @@ from ansible.module_utils.parsing.convert_bool import boolean
 from ansible.plugins.action import ActionBase
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
-from kubernetes import client, config
-from ansible.errors import AnsibleError
 
 TEKNOIR = ['teknoir']
 DOCKER = ['docker', 'community.general.docker', 'community.docker.docker']
@@ -31,8 +26,6 @@ except ImportError:
 display = Display()
 
 class ActionModule(ActionBase):
-
-    portforward_subprocess = None
 
     def _get_absolute_path(self, path):
         original_path = path
@@ -138,75 +131,6 @@ class ActionModule(ActionBase):
             if key.startswith("ansible_") and key.endswith("_interpreter"):
                 task_vars[key] = localhost[key]
 
-    def _connect(self):
-        device_name = self._connection._options.get('teknoir_device')
-        namespace = self._connection._options.get('kubectl_namespace')
-        tunnel_open = self._connection._options.get('teknoir_tunnel_open')
-        tunnel_port = self._connection._options.get('teknoir_tunnel_port')
-        ansible_group = namespace.replace('-', '_')
-        self.inventory = f'{ansible_group}-{device_name}'
-
-        config.load_kube_config()
-        custom_api = client.CustomObjectsApi()
-
-        if not tunnel_open:
-            self._start_reverse_tunnel(custom_api, namespace, device_name, tunnel_port)
-
-        if ActionModule.portforward_subprocess is None:
-            display.v("Start port-forward to deadend pod", host=self.inventory)
-            cmd = 'kubectl --namespace=deadend-system port-forward svc/deadendproxy 8228:8118'
-            display.vvv(cmd, host=self.inventory)
-            ActionModule.portforward_subprocess = subprocess.Popen(cmd,
-                                                           shell=True,
-                                                           stdout=subprocess.PIPE,
-                                                           stderr=subprocess.PIPE,
-                                                           preexec_fn=os.setsid)
-
-            not_forever = 20
-            while True:
-                display.v(f"Waiting for port-forward ({20-not_forever}/20)", host=self.inventory)
-                time.sleep(2)
-                if ActionModule.portforward_subprocess.poll() is not None:
-                    display.v(f"Port-forward did not start correctly", host=self.inventory)
-                    ActionModule.portforward_subprocess = None
-                    break
-                elif not_forever <= 0:
-                    break
-                else:
-                    nextline = ActionModule.portforward_subprocess.stdout.readline()
-                    if b'Forwarding from' in nextline:
-                        display.v(f"Port-forwarding is up and running", host=self.inventory)
-                        break
-                not_forever -= 1
-
-            not_forever = 300
-            while True:
-                display.v(f"Waiting for reverse tunnel ({300-not_forever}/300)", host=self.inventory)
-                returncode = not_forever
-                try:
-                    cmd = shlex_quote('exit')
-                    # Tests the wrong port-forward port but that might not matter, as we wait for the tunnel here...?
-                    (returncode, _, _) = self._connection.exec_command(cmd, None, sudoable=False)
-                except AnsibleError as e:
-                    pass
-
-                if returncode == 0:
-                    display.v(f"Reverse tunnel is up and running", host=self.inventory)
-                    break
-                elif not_forever <= 0:
-                        break
-
-                not_forever -= 1
-                time.sleep(2)
-    
-    def _disconnect(self):
-        """Terminate the connection"""
-        if ActionModule.portforward_subprocess is not None:
-            display.v(f"Killing port-forwarding (close)", host=self.inventory)
-            os.killpg(os.getpgid(ActionModule.portforward_subprocess.pid), signal.SIGTERM)
-            ActionModule.portforward_subprocess = None
-        pass
-    
     def run(self, tmp=None, task_vars=None):
         ''' generates params and passes them on to the rsync module '''
         # When modifying this function be aware of the tricky convolutions
@@ -263,8 +187,6 @@ class ActionModule(ActionBase):
             self._docker_cmd = self._connection._options['podman_executable']
             if self._connection._options.get('podman_extra_args'):
                 self._docker_cmd = "%s %s" % (self._docker_cmd, self._connection._options['podman_extra_args'])
-        elif self._remote_transport in TEKNOIR:
-            self._connect()
 
         # self._connection accounts for delegate_to so
         # remote_transport is the transport ansible thought it would need
@@ -492,8 +414,5 @@ class ActionModule(ActionBase):
 
         # run the module and store the result
         result.update(self._execute_module('rsync', module_args=_tmp_args, task_vars=task_vars))
-
-        if self._remote_transport in TEKNOIR:
-            self._disconnect()
 
         return result

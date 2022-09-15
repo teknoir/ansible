@@ -1,17 +1,16 @@
 from __future__ import (absolute_import, division, print_function)
 
 import base64
-import os
-import random
 import signal
 import subprocess
-import time
-from ansible.module_utils.six.moves import shlex_quote
-
+import importlib.util
+import os
+import atexit
+from time import sleep
 from ansible.utils.display import Display
 from kubernetes import client, config
 
-from ansible.errors import AnsibleError
+from ansible.errors import AnsibleConnectionFailure
 
 __metaclass__ = type
 
@@ -377,12 +376,6 @@ display = Display()
 # class ConnectionBase(SSHConnection):
 #     pass
 
-
-import functools
-import importlib.util
-import os
-import time
-
 def load_module(name, path):
     module_spec = importlib.util.spec_from_file_location(
         name, path
@@ -411,14 +404,9 @@ class Connection(SSH.Connection):
         self.inventory = 'teknoir'
 
     def __exit__(self, exc_type, exc_value, traceback):
-        display.v(f"(exit)", host=self.inventory)
-        if Connection.portforward_subprocess is not None:
-            display.v(f"Killing port-forwarding (exit)", host=self.inventory)
-            os.killpg(os.getpgid(Connection.portforward_subprocess.pid), signal.SIGTERM)
-            Connection.portforward_subprocess = None
+        display.vv(f"(exit)", host=self.inventory)
 
     def _start_reverse_tunnel(self, custom_api, namespace, name, port):
-        display.v(f"Start reverse tunnel", host=self.inventory)
         device_patch = {
             "spec": {
                 "keys": {
@@ -466,60 +454,47 @@ class Connection(SSH.Connection):
         custom_api = client.CustomObjectsApi()
 
         if not tunnel_open:
+            display.v(f"Start reverse tunnel, PORT({tunnel_port})", host=self.inventory)
             self._start_reverse_tunnel(custom_api, namespace, device_name, tunnel_port)
-
-        if Connection.portforward_subprocess is None:
-            display.v("Start port-forward to deadend pod", host=self.inventory)
-            cmd = 'kubectl --namespace=deadend-system port-forward svc/deadendproxy 8118:8118'
-            display.vvv(cmd, host=self.inventory)
-            Connection.portforward_subprocess = subprocess.Popen(cmd,
-                                                           shell=True,
-                                                           stdout=subprocess.PIPE,
-                                                           stderr=subprocess.PIPE,
-                                                           preexec_fn=os.setsid)
-
-            not_forever = 20
-            while True:
-                display.v(f"Waiting for port-forward ({20-not_forever}/20)", host=self.inventory)
-                time.sleep(2)
-                if Connection.portforward_subprocess.poll() is not None:
-                    display.v(f"Port-forward did not start correctly", host=self.inventory)
-                    Connection.portforward_subprocess = None
-                    break
-                elif not_forever <= 0:
-                    break
-                else:
-                    nextline = Connection.portforward_subprocess.stdout.readline()
-                    if b'Forwarding from' in nextline:
-                        display.v(f"Port-forwarding is up and running", host=self.inventory)
-                        break
-                not_forever -= 1
-
-            not_forever = 300
-            while True:
-                display.v(f"Waiting for reverse tunnel ({300-not_forever}/300)", host=self.inventory)
-                returncode = not_forever
-                try:
-                    cmd = shlex_quote('exit')
-                    (returncode, _, _) = super(Connection, self).exec_command(cmd, None, sudoable=False)
-                except AnsibleError as e:
-                    pass
-
-                if returncode == 0:
-                    display.v(f"Reverse tunnel is up and running", host=self.inventory)
-                    break
-                elif not_forever <= 0:
-                        break
-
-                not_forever -= 1
-                time.sleep(2)
+            self.set_option('teknoir_tunnel_open', True)
 
         return self
 
     def close(self):
-        """Terminate the connection"""
+        super(Connection, self).close()
+
+    @staticmethod
+    def start_portforward():
+        display.vv(f"Checking start port-forward to deadendproxy", host="localhost")
+        if Connection.portforward_subprocess is None:
+            display.v(f"Start port-forward to deadendproxy", host="localhost")
+            cmd = "kubectl --namespace=deadend-system port-forward svc/deadendproxy 8118:8118"
+            display.vvv(cmd, host="localhost")
+            Connection.portforward_subprocess = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                      preexec_fn=os.setsid)
+
+            display.v(f"Port-forward not yet warmed up", host="localhost")
+            sleep(4)
+            display.v(f"Port-forward warmed up", host="localhost")
+
+            if Connection.portforward_subprocess.poll() is not None:
+                raise AnsibleConnectionFailure(
+                    f"Port-forward did not start correctly...maybe you need to kill a process blocking the 8118 port!?")
+
+            nextline = Connection.portforward_subprocess.stdout.readline()
+            if b'Forwarding from' in nextline:
+                display.vv(f"Port-forwarding is up and running, Nextline: ({nextline.decode()}), PID({Connection.portforward_subprocess.pid})", host="localhost")
+            else:
+                raise AnsibleConnectionFailure(
+                    f"Port-forward almost ready..., Nextline: ({nextline.decode()}) ...maybe you need to kill a process blocking the 8118 port!?")
+
+    @staticmethod
+    def stop_portforward():
         if Connection.portforward_subprocess is not None:
-            display.v(f"Killing port-forwarding (close)", host=self.inventory)
+            display.v(f"Killing port-forwarding (close), PID({Connection.portforward_subprocess.pid})", host="localhost")
             os.killpg(os.getpgid(Connection.portforward_subprocess.pid), signal.SIGTERM)
             Connection.portforward_subprocess = None
-        pass
+
+
+Connection.start_portforward()
+atexit.register(Connection.stop_portforward)
