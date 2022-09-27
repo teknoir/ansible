@@ -37,7 +37,14 @@ class TeknoirInventory(object):
         return base64.b64decode(s.encode('utf-8')).decode('utf-8')
 
     def teknoir_inventory(self):
-        config.load_kube_config()
+        try:
+            config.load_kube_config()
+        except config.ConfigException:
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                raise Exception("Could not configure kubernetes python client")
+
         custom_api = client.CustomObjectsApi()
         devices = custom_api.list_cluster_custom_object(group="kubeflow.org",
                                                         version="v1",
