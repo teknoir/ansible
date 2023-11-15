@@ -94,6 +94,7 @@ class TeknoirInventory(object):
 
 
             inventory['_meta']['hostvars'][hostname] = {
+                'ansible_namespace': device["metadata"]["namespace"],
                 'ansible_connection': 'teknoir',
                 'ansible_port': tunnel_port,
                 'ansible_host': 'localhost',
