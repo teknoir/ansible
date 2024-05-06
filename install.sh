@@ -41,8 +41,8 @@ install_teknoir_ansible() {
   mkdir -p ${HOME}/.ansible/plugins/connection
 
   cp -f inventory.py ${HOME}/.ansible/inventory.py
-  cp -rf module_plugins/* ${HOME}/.ansible/plugins/modules/
-  cp -rf action_plugins/* ${HOME}/.ansible/plugins/action/
+#  cp -rf module_plugins/* ${HOME}/.ansible/plugins/modules/
+#  cp -rf action_plugins/* ${HOME}/.ansible/plugins/action/
   cp -rf connection_plugins/* ${HOME}/.ansible/plugins/connection/
 }
 

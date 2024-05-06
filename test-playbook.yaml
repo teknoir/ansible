@@ -9,22 +9,34 @@
         state: directory
         mode: 777
 
-    - name: Copy ansible dir
-      rsync:
-        src: .
-        dest: /tmp/ansible/
-        recursive: yes
-        delete: yes
-        rsync_opts:
-          - --include=action_plugins/
-          - --include=connection_plugins/
-          - --include=module_plugins/
-          - --include=*.yaml
-          - --include=*.cfg
-          - --include=*.sh
-          - --include=*.py
-          - --include=*.md
-          - --exclude=*
+#    - name: Copy ansible dir
+#      rsync:
+#        src: .
+#        dest: /tmp/ansible/
+#        recursive: yes
+#        delete: yes
+#        rsync_opts:
+#          - --include=action_plugins/
+#          - --include=connection_plugins/
+#          - --include=module_plugins/
+#          - --include=*.yaml
+#          - --include=*.cfg
+#          - --include=*.sh
+#          - --include=*.py
+#          - --include=*.md
+#          - --exclude=*
+
+    - name: Copy ansible files
+      copy:
+        src: '{{item}}'
+        dest: '/tmp/ansible'
+        owner: teknoir
+        group: teknoir
+        mode: 0644
+      loop:
+        - install.sh
+        - inventory.py
+        - connection_plugins/teknoir.py
 
     - name: Get the dist info
       shell: "uname -a"

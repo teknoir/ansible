@@ -31,7 +31,7 @@ class TeknoirInventory(object):
         else:
             self.inventory = self.empty_inventory()
 
-        print(json.dumps(self.inventory, indent=4, sort_keys=True));
+        print(json.dumps(self.inventory, indent=4, sort_keys=True))
 
     def decode(self, s):
         return base64.b64decode(s.encode('utf-8')).decode('utf-8')
@@ -44,6 +44,16 @@ class TeknoirInventory(object):
                 config.load_incluster_config()
             except config.ConfigException:
                 raise Exception("Could not configure kubernetes python client")
+
+        current_context = config.list_kube_config_contexts()[1]
+
+        def get_domain(value):
+            return {
+                'gke_teknoir_us-central1-c_teknoir-cluster': 'teknoir.cloud',
+                'gke_teknoir-poc_us-central1-c_teknoir-dev-cluster': 'teknoir.dev',
+            }.get(value, 'teknoir.cloud')
+        domain = get_domain(current_context['context']['cluster'])
+
 
         custom_api = client.CustomObjectsApi()
         devices = custom_api.list_cluster_custom_object(group="kubeflow.org",
@@ -86,12 +96,20 @@ class TeknoirInventory(object):
                     outfile.write(self.decode(device['spec']['keys']['data']['rsa_private']))
                 os.chmod(private_key_file, 0o400)
 
-            tunnel_opened = True
-            tunnel_port = self.decode(device['spec']['keys']['data']['tunnel'])
-            if not tunnel_port.isdigit():
-                tunnel_port = str(random.randint(1024, 64511))
-                tunnel_opened = False
+            # print(json.dumps(device, indent=4, sort_keys=True))
 
+            tunnel_port = str(random.randint(1024, 64511))
+            tunnel_opened = False
+            if ('remote_access' in device['subresources']['status'] and
+                'active' in device['subresources']['status']['remote_access'] and
+                'port' in device['subresources']['status']['remote_access']):
+                tunnel_opened = device['subresources']['status']['remote_access']['active']
+                tunnel_port = device['subresources']['status']['remote_access']['port']
+
+            if ('data' not in device['spec']['keys'] or
+                'username' not in device['spec']['keys']['data'] or
+                'userpassword' not in device['spec']['keys']['data']):
+                continue
 
             inventory['_meta']['hostvars'][hostname] = {
                 'ansible_namespace': device["metadata"]["namespace"],
@@ -109,7 +127,8 @@ class TeknoirInventory(object):
                 'ansible_kubectl_namespace': device["metadata"]["namespace"],
                 'ansible_teknoir_tunnel_port': tunnel_port,
                 'ansible_teknoir_tunnel_open': tunnel_opened,
-                'ansible_teknoir_device': device['metadata']['name']
+                'ansible_teknoir_device': device['metadata']['name'],
+                'ansible_teknoir_domain': domain,
             }
         return inventory
 

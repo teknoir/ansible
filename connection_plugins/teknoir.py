@@ -361,6 +361,12 @@ DOCUMENTATION = '''
         vars:
           - name: ansible_teknoir_device
           - name: delegated_vars['ansible_teknoir_device']
+      teknoir_domain:
+        description:
+          - The domain the device belongs to
+        vars:
+          - name: ansible_teknoir_domain
+          - name: delegated_vars['ansible_teknoir_domain']
 '''
 
 try:
@@ -408,10 +414,18 @@ class Connection(SSH.Connection):
 
     def _start_reverse_tunnel(self, custom_api, namespace, name, port):
         device_patch = {
-            "spec": {
-                "keys": {
-                    "data": {
-                        "tunnel": base64.b64encode(port.encode('utf-8')).decode('utf-8')
+            # "spec": {
+            #     "keys": {
+            #         "data": {
+            #             "tunnel": base64.b64encode(port.encode('utf-8')).decode('utf-8')
+            #         }
+            #     }
+            # }
+            "subresources": {
+                "status": {
+                    "remote_access": {
+                        "active": "true",
+                        "port": port
                     }
                 }
             }
@@ -426,10 +440,17 @@ class Connection(SSH.Connection):
     def _stop_reverse_tunnel(self, custom_api, namespace, name):
         display.v(f"Stop reverse tunnel", host=self.inventory)
         device_patch = {
-            "spec": {
-                "keys": {
-                    "data": {
-                        "tunnel": base64.b64encode('NA'.encode('utf-8')).decode('utf-8')
+            # "spec": {
+            #     "keys": {
+            #         "data": {
+            #             "tunnel": base64.b64encode('NA'.encode('utf-8')).decode('utf-8')
+            #         }
+            #     }
+            # }
+            "subresources": {
+                "status": {
+                    "remote_access": {
+                        "active": "false"
                     }
                 }
             }
@@ -447,6 +468,7 @@ class Connection(SSH.Connection):
         namespace = self.get_option('kubectl_namespace')
         tunnel_open = self.get_option('teknoir_tunnel_open')
         tunnel_port = self.get_option('teknoir_tunnel_port')
+        domain = self.get_option('teknoir_domain')
         ansible_group = namespace.replace('-', '_').replace('.', '_')
         self.inventory = f'{ansible_group}-{device_name}'
 
@@ -458,43 +480,13 @@ class Connection(SSH.Connection):
             self._start_reverse_tunnel(custom_api, namespace, device_name, tunnel_port)
             self.set_option('teknoir_tunnel_open', True)
 
+        deadendhost = f'deadend.{domain}'
+        deadendport = 2222
+        ssh_args = f'-o "ProxyCommand ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {self.get_option("private_key_file")} -N -W %h:%p {self.get_option("remote_user")}@{deadendhost} -p {deadendport}"'
+        display.vv(f"(ssh_args={ssh_args})", host=self.inventory)
+        self.set_option('ssh_args', ssh_args)
+
         return self
 
     def close(self):
         super(Connection, self).close()
-
-    @staticmethod
-    def start_portforward():
-        display.vv(f"Checking start port-forward to deadendproxy", host="localhost")
-        if Connection.portforward_subprocess is None:
-            display.v(f"Start port-forward to deadendproxy", host="localhost")
-            cmd = "kubectl --namespace=deadend-system port-forward svc/deadendproxy 8118:8118"
-            display.vvv(cmd, host="localhost")
-            Connection.portforward_subprocess = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                                      preexec_fn=os.setsid)
-
-            display.v(f"Port-forward not yet warmed up", host="localhost")
-            sleep(4)
-            display.v(f"Port-forward warmed up", host="localhost")
-
-            if Connection.portforward_subprocess.poll() is not None:
-                raise AnsibleConnectionFailure(
-                    f"Port-forward did not start correctly...maybe you need to kill a process blocking the 8118 port!?")
-
-            nextline = Connection.portforward_subprocess.stdout.readline()
-            if b'Forwarding from' in nextline:
-                display.vv(f"Port-forwarding is up and running, Nextline: ({nextline.decode()}), PID({Connection.portforward_subprocess.pid})", host="localhost")
-            else:
-                raise AnsibleConnectionFailure(
-                    f"Port-forward almost ready..., Nextline: ({nextline.decode()}) ...maybe you need to kill a process blocking the 8118 port!?")
-
-    @staticmethod
-    def stop_portforward():
-        if Connection.portforward_subprocess is not None:
-            display.v(f"Killing port-forwarding (close), PID({Connection.portforward_subprocess.pid})", host="localhost")
-            os.killpg(os.getpgid(Connection.portforward_subprocess.pid), signal.SIGTERM)
-            Connection.portforward_subprocess = None
-
-
-Connection.start_portforward()
-atexit.register(Connection.stop_portforward)
