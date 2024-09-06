@@ -23,13 +23,6 @@ check_ansible() {
   fi
 }
 
-check_corkscrew() {
-  if [ ! command -v corkscrew &> /dev/null ]; then
-      fatal "Command corkscrew could not be found, please install with ex. \"brew install corkscrew\""
-  fi
-}
-
-
 install_teknoir_ansible() {
   check_ansible
   check_corkscrew
