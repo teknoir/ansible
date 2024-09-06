@@ -25,7 +25,6 @@ check_ansible() {
 
 install_teknoir_ansible() {
   check_ansible
-  check_corkscrew
 
   cp ansible.cfg ${HOME}/.ansible.cfg
 
