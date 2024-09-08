@@ -1,5 +1,8 @@
-# Teknoir Ansible Inventory and Connection Plugin
-The easiest way to start off is to copy content of this repo
+# Teknoir Ansible Inventory Plugin
+The easiest way to start off is to clone and run the install script:
+```bash
+./install.sh
+```
 
 > Ofc you need to have Ansible installed!
 > ... and kubernetes python packages
