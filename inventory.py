@@ -68,7 +68,9 @@ class TeknoirInventory(object):
 
         for device in devices['items']:
             ansible_group = device["metadata"]["namespace"].replace('-', '_').replace('.', '_')
-            path = f'inv/{ansible_group}/'
+
+            home_dir = os.path.expanduser("~")
+            inventory_path = os.path.join(home_dir, ".ansible", "tmp", "inv", ansible_group)
             hostname = f'{device["metadata"]["name"]}'
 
             if ansible_group not in inventory:
@@ -76,7 +78,7 @@ class TeknoirInventory(object):
                     'hosts': [],
                     'vars': {}
                 }
-                os.makedirs(path, exist_ok=True)
+                os.makedirs(inventory_path, exist_ok=True)
             inventory[ansible_group]['hosts'].append(hostname)
 
             for label, value in device["metadata"]["labels"].items():
@@ -90,7 +92,7 @@ class TeknoirInventory(object):
                     }
                 inventory[additional_group]['hosts'].append(hostname)
 
-            private_key_file = f'{path}{device["metadata"]["name"]}.pem'
+            private_key_file = os.path.join(inventory_path, f'{device["metadata"]["name"]}.pem')
             if not os.path.isfile(private_key_file):
                 with open(private_key_file, 'w') as outfile:
                     outfile.write(self.decode(device['spec']['keys']['data']['rsa_private']))
@@ -111,17 +113,20 @@ class TeknoirInventory(object):
                 'userpassword' not in device['spec']['keys']['data']):
                 continue
 
+            deadendhost = f'deadend.{domain}'
+            deadendport = 2222
+            username = self.decode(device['spec']['keys']['data']['username'])
+            userpassword = self.decode(device['spec']['keys']['data']['userpassword'])
             inventory['_meta']['hostvars'][hostname] = {
                 'ansible_namespace': device["metadata"]["namespace"],
-                'ansible_connection': 'teknoir',
                 'ansible_port': tunnel_port,
-                'ansible_host': 'localhost',
-                'ansible_user': self.decode(device['spec']['keys']['data']['username']),
-                'ansible_sudo_pass': self.decode(device['spec']['keys']['data']['userpassword']),
-                'ansible_become': 'yes',
+                'ansible_host': '127.0.0.1',
+                'ansible_user': username,
+                'ansible_sudo_pass': userpassword,
                 'ansible_become_user': 'root',
-                'ansible_become_pass': self.decode(device['spec']['keys']['data']['userpassword']),
+                'ansible_become_pass': userpassword,
                 'ansible_ssh_private_key_file': private_key_file,
+                'ansible_ssh_args': f'-o ProxyCommand="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {private_key_file} -N -W %h:%p {username}@{deadendhost} -p {deadendport}"',
                 'ansible_python_interpreter': '/usr/bin/python3',
                 'ansible_ssh_retries': 20,
                 'ansible_kubectl_namespace': device["metadata"]["namespace"],

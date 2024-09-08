@@ -23,27 +23,11 @@ check_ansible() {
   fi
 }
 
-check_corkscrew() {
-  if [ ! command -v corkscrew &> /dev/null ]; then
-      fatal "Command corkscrew could not be found, please install with ex. \"brew install corkscrew\""
-  fi
-}
-
-
 install_teknoir_ansible() {
   check_ansible
-  check_corkscrew
 
   cp ansible.cfg ${HOME}/.ansible.cfg
-
-  mkdir -p ${HOME}/.ansible/plugins/modules
-  mkdir -p ${HOME}/.ansible/plugins/action
-  mkdir -p ${HOME}/.ansible/plugins/connection
-
   cp -f inventory.py ${HOME}/.ansible/inventory.py
-#  cp -rf module_plugins/* ${HOME}/.ansible/plugins/modules/
-#  cp -rf action_plugins/* ${HOME}/.ansible/plugins/action/
-  cp -rf connection_plugins/* ${HOME}/.ansible/plugins/connection/
 }
 
 if [ "${TEKNOIR_FRONTEND}" = "noninteractive" ]; then
