@@ -27,15 +27,7 @@ install_teknoir_ansible() {
   check_ansible
 
   cp ansible.cfg ${HOME}/.ansible.cfg
-
-  mkdir -p ${HOME}/.ansible/plugins/modules
-  mkdir -p ${HOME}/.ansible/plugins/action
-  mkdir -p ${HOME}/.ansible/plugins/connection
-
   cp -f inventory.py ${HOME}/.ansible/inventory.py
-#  cp -rf module_plugins/* ${HOME}/.ansible/plugins/modules/
-#  cp -rf action_plugins/* ${HOME}/.ansible/plugins/action/
-  cp -rf connection_plugins/* ${HOME}/.ansible/plugins/connection/
 }
 
 if [ "${TEKNOIR_FRONTEND}" = "noninteractive" ]; then
