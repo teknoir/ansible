@@ -56,7 +56,7 @@ class TeknoirInventory(object):
 
 
         custom_api = client.CustomObjectsApi()
-        devices = custom_api.list_cluster_custom_object(group="kubeflow.org",
+        devices = custom_api.list_cluster_custom_object(group="teknoir.org",
                                                         version="v1",
                                                         plural="devices")
 
@@ -125,8 +125,9 @@ class TeknoirInventory(object):
                 'ansible_sudo_pass': userpassword,
                 'ansible_become_user': 'root',
                 'ansible_become_pass': userpassword,
+                'ansible_become_flags': '-E',
                 'ansible_ssh_private_key_file': private_key_file,
-                'ansible_ssh_args': f'-o ProxyCommand="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {private_key_file} -N -W %h:%p {username}@{deadendhost} -p {deadendport}"',
+                'ansible_ssh_args': f'-o ForwardAgent=yes -o ProxyCommand="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {private_key_file} -N -W %h:%p {username}@{deadendhost} -p {deadendport}"',
                 'ansible_python_interpreter': '/usr/bin/python3',
                 'ansible_ssh_retries': 20,
                 'ansible_kubectl_namespace': device["metadata"]["namespace"],
