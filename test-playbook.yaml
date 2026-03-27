@@ -7,15 +7,38 @@
       ansible.builtin.file:
         path: /home/{{ ansible_user }}/tmp/ansible
         state: directory
-        mode: 777
+        mode: '0755'
 
-    - name: Copy ansible dir
+    - name: Ensure local tmp ansible dir
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: ./tmp/ansible
+        state: directory
+        mode: '0755'
+
+    - name: Copy ansible dir to remote host
       ansible.builtin.synchronize:
         use_ssh_args: true
-        src: .
+        src: ./
         dest: /home/{{ ansible_user }}/tmp/ansible/
         recursive: yes
         delete: yes
+        rsync_opts:
+          - --include=*.yaml
+          - --include=*.cfg
+          - --include=*.sh
+          - --include=*.py
+          - --include=*.md
+          - --exclude=*
+
+    - name: Copy ansible dir back to local
+      ansible.builtin.synchronize:
+        use_ssh_args: true
+        src: /home/{{ ansible_user }}/tmp/ansible/
+        dest: ./tmp/ansible/
+        recursive: yes
+        delete: yes
+        mode: pull
         rsync_opts:
           - --include=*.yaml
           - --include=*.cfg

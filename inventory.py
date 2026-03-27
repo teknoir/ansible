@@ -45,7 +45,9 @@ class TeknoirInventory(object):
             except config.ConfigException:
                 raise Exception("Could not configure kubernetes python client")
 
-        current_context = config.list_kube_config_contexts()[1]
+        contexts, current_context = config.list_kube_config_contexts()
+        if not contexts or len(contexts) < 2:
+            raise Exception("No valid kube config contexts found")
 
         def get_domain(value):
             return {
@@ -53,12 +55,13 @@ class TeknoirInventory(object):
                 'gke_teknoir-poc_us-central1-c_teknoir-dev-cluster': 'teknoir.dev',
             }.get(value, 'teknoir.cloud')
         domain = get_domain(current_context['context']['cluster'])
-
+        namespace = current_context['context'].get('namespace', os.environ.get('NAMESPACE', 'default'))
 
         custom_api = client.CustomObjectsApi()
-        devices = custom_api.list_cluster_custom_object(group="teknoir.org",
-                                                        version="v1",
-                                                        plural="devices")
+        devices = custom_api.list_namespaced_custom_object(group="teknoir.org",
+                                                           version="v1",
+                                                           namespace=namespace,
+                                                           plural="devices")
 
         inventory = {
             '_meta': {
@@ -113,10 +116,12 @@ class TeknoirInventory(object):
                 'userpassword' not in device['spec']['keys']['data']):
                 continue
 
-            deadendhost = f'deadend.{domain}'
+            deadendhost = f'deadend-{namespace}.{domain}'
             deadendport = 2222
             username = self.decode(device['spec']['keys']['data']['username'])
             userpassword = self.decode(device['spec']['keys']['data']['userpassword'])
+            ppcmd = f"openssl s_client -quiet -connect {deadendhost}:{deadendport} -servername {deadendhost}"
+            pcmd = f"ssh -o ProxyCommand='{ppcmd}' -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {private_key_file} -N -W %h:%p teknoir@{deadendhost} -p {deadendport}"
             inventory['_meta']['hostvars'][hostname] = {
                 'ansible_namespace': device["metadata"]["namespace"],
                 'ansible_port': tunnel_port,
@@ -127,7 +132,7 @@ class TeknoirInventory(object):
                 'ansible_become_pass': userpassword,
                 'ansible_become_flags': '-E',
                 'ansible_ssh_private_key_file': private_key_file,
-                'ansible_ssh_args': f'-o ForwardAgent=yes -o ProxyCommand="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {private_key_file} -N -W %h:%p {username}@{deadendhost} -p {deadendport}"',
+                'ansible_ssh_args': f'-o ForwardAgent=yes -o ProxyCommand="{pcmd}"',
                 'ansible_python_interpreter': '/usr/bin/python3',
                 'ansible_ssh_retries': 20,
                 'ansible_kubectl_namespace': device["metadata"]["namespace"],
