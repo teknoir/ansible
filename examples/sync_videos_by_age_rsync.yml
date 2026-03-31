@@ -1,0 +1,383 @@
+---
+# ==============================================================================
+# Ansible Playbook: sync_videos_by_age_rsync.yml
+# Description: Sync video files based on age using rsync from remote host to local
+# Usage: ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit <host>
+#        ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit <host> -e "max_age_minutes=10"
+#        ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit <host> -e "dry_run=true"
+#        ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit victra-poc-02 \
+#         -e "max_age_minutes=5" \
+#         -e "source_dir=/opt/teknoir/video/segments" \
+#         -e "video_prefixes=['nc0009-pos','nc0009-height-strip','nc0009-salefloor-0','nc0009-salefloor-90','nc0009-salefloor-180','nc0009-salefloor-270']"
+# ==============================================================================
+
+- name: Sync video files from remote host to local based on age
+  hosts: all
+  gather_facts: yes
+
+  vars:
+    # Configuration
+    source_dir: "/opt/teknoir/video/segments"
+    dest_dir: "{{ playbook_dir }}/tmp/synced-videos"
+    max_age_minutes: 5
+    file_pattern: "*.mp4"
+    preserve_structure: true
+    dry_run: false
+    # Video processing configuration
+    process_videos: true
+    output_dir: "{{ playbook_dir }}/tmp/processed-videos"
+    video_prefixes: []  # Override with -e "video_prefixes=['nc0009-pos','nc0009-height-strip']"
+    ffmpeg_crf: 18
+    ffmpeg_preset: "slow"
+
+  tasks:
+    # ==========================================================================
+    # Validation and Setup
+    # ==========================================================================
+
+    - name: Display configuration
+      debug:
+        msg:
+          - "=========================================="
+          - "SYNC CONFIGURATION"
+          - "=========================================="
+          - "Source: {{ inventory_hostname }}:{{ source_dir }}"
+          - "Destination: localhost:{{ dest_dir }}"
+          - "Max age: {{ max_age_minutes }} minutes"
+          - "File pattern: {{ file_pattern }}"
+          - "Preserve structure: {{ preserve_structure }}"
+          - "Dry run: {{ dry_run }}"
+          - "=========================================="
+
+    - name: Fail if running against localhost
+      fail:
+        msg: "This playbook is designed to sync from remote hosts only. Use --limit to specify a remote host."
+      when: inventory_hostname == 'localhost'
+
+    - name: Check if rsync is installed on source host
+      command: which rsync
+      register: rsync_check_source
+      failed_when: false
+      changed_when: false
+
+    - name: Check if rsync is installed on localhost
+      command: which rsync
+      register: rsync_check_local
+      delegate_to: localhost
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if rsync is not available on source
+      fail:
+        msg: "rsync is not installed on {{ inventory_hostname }}. Please install rsync first."
+      when: rsync_check_source.rc != 0
+
+    - name: Fail if rsync is not available on localhost
+      fail:
+        msg: "rsync is not installed on localhost. Please install rsync first."
+      when: rsync_check_local.rc != 0
+
+    - name: Check if source directory exists
+      stat:
+        path: "{{ source_dir }}"
+      register: source_stat
+
+    - name: Fail if source directory does not exist
+      fail:
+        msg: "Source directory does not exist on {{ inventory_hostname }}: {{ source_dir }}"
+      when: not source_stat.stat.exists or not source_stat.stat.isdir
+
+    - name: Create destination directory on localhost
+      file:
+        path: "{{ dest_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      when: not (dry_run | bool)
+
+    # ==========================================================================
+    # Find files and generate rsync filters
+    # ==========================================================================
+
+    - name: Find files matching age criteria on source host
+      find:
+        paths: "{{ source_dir }}"
+        patterns: "{{ file_pattern }}"
+        excludes: "*.tmp.*"
+        recurse: yes
+        age: "-{{ max_age_minutes }}m"
+        age_stamp: mtime
+      register: files_found
+
+    - name: Display number of files found
+      debug:
+        msg: "Found {{ files_found.files | length }} file(s) matching criteria on {{ inventory_hostname }}"
+
+    - name: Debug first few file paths (for troubleshooting)
+      debug:
+        msg: "Sample files: {{ files_found.files[:5] | map(attribute='path') | list }}"
+      when: files_found.files | length > 0
+
+    - name: Filter files by video_prefixes (if specified)
+      set_fact:
+        filtered_files: "{{ files_found.files | rejectattr('path', 'search', '\\.tmp\\.mp4$') | selectattr('path', 'search', '(' + (video_prefixes | join('|')) + ')_[0-9]+\\.mp4$') | list }}"
+      when:
+        - files_found.files | length > 0
+        - video_prefixes | length > 0
+
+    - name: Use all files if no prefixes specified
+      set_fact:
+        filtered_files: "{{ files_found.files | rejectattr('path', 'search', '\\.tmp\\.mp4$') | list }}"
+      when:
+        - files_found.files | length > 0
+        - video_prefixes | length == 0
+
+    - name: Display number of files after prefix filtering
+      debug:
+        msg:
+          - "After prefix filtering: {{ filtered_files | length }} file(s) will be synced"
+          - "Prefixes used: {{ video_prefixes }}"
+      when: filtered_files is defined
+
+    - name: Build rsync filter options
+      set_fact:
+        rsync_filter_opts: "{{ rsync_filter_opts | default([]) + ['--include=' + (item.path | regex_replace('^' + source_dir + '/', ''))] }}"
+      loop: "{{ filtered_files }}"
+      when: filtered_files | length > 0
+
+    - name: Add directory include rules for preserve structure
+      set_fact:
+        rsync_filter_opts: "{{ rsync_filter_opts | default([]) + ['--include=' + (item.path | regex_replace('^' + source_dir + '/', '') | regex_replace('/[^/]*$', '') + '/')] }}"
+      loop: "{{ filtered_files }}"
+      when:
+        - filtered_files | length > 0
+        - preserve_structure
+
+    - name: Remove duplicate directory rules
+      set_fact:
+        rsync_filter_opts: "{{ rsync_filter_opts | unique }}"
+      when: filtered_files | length > 0
+
+    - name: Add exclude all rule
+      set_fact:
+        rsync_filter_opts: "{{ rsync_filter_opts + ['--exclude=*'] }}"
+      when: filtered_files | length > 0
+
+    - name: Build complete rsync_opts
+      set_fact:
+        rsync_opts: "{{ rsync_filter_opts + ['--stats', '-v'] + (['--dry-run'] if dry_run | bool else []) }}"
+      when: filtered_files | length > 0
+
+    - name: Display rsync options (when dry_run)
+      debug:
+        msg: "{{ rsync_opts }}"
+      when:
+        - filtered_files | length > 0
+        - dry_run | bool
+
+    # ==========================================================================
+    # Sync with rsync
+    # ==========================================================================
+
+    - name: Sync files using rsync with filter
+      synchronize:
+        use_ssh_args: true
+        src: "{{ source_dir }}/"
+        dest: "{{ dest_dir }}/"
+        mode: pull
+        archive: yes
+        delete: no
+        rsync_opts: "{{ rsync_opts }}"
+      register: rsync_result
+      when: filtered_files | length > 0
+
+    - name: Display rsync output
+      debug:
+        var: rsync_result.stdout_lines
+      when:
+        - filtered_files | length > 0
+        - rsync_result is defined
+
+    # ==========================================================================
+    # Cleanup and Summary
+    # ==========================================================================
+
+    - name: Display summary
+      debug:
+        msg:
+          - "=========================================="
+          - "{{ 'SUMMARY (DRY RUN)' if dry_run | bool else 'SUMMARY' }}"
+          - "=========================================="
+          - "Source: {{ inventory_hostname }}:{{ source_dir }}"
+          - "Destination: localhost:{{ dest_dir }}"
+          - "Files found: {{ files_found.files | length }}"
+          - "{{ 'Files would be synced (dry run mode)' if dry_run | bool else 'Sync completed successfully' }}"
+          - "=========================================="
+      when: files_found.files | length > 0
+
+    - name: No files found message
+      debug:
+        msg:
+          - "=========================================="
+          - "No files found matching criteria"
+          - "=========================================="
+          - "Host: {{ inventory_hostname }}"
+          - "Directory: {{ source_dir }}"
+          - "Pattern: {{ file_pattern }}"
+          - "Max age: {{ max_age_minutes }} minutes"
+          - "=========================================="
+      when: files_found.files | length == 0
+
+    # ==========================================================================
+    # Video Processing with FFmpeg
+    # ==========================================================================
+
+    - name: Check if ffmpeg is installed on localhost
+      command: which ffmpeg
+      register: ffmpeg_check
+      delegate_to: localhost
+      failed_when: false
+      changed_when: false
+      when: process_videos | bool
+
+    - name: Fail if ffmpeg is not available
+      fail:
+        msg: "ffmpeg is not installed on localhost. Please install ffmpeg first."
+      when:
+        - process_videos | bool
+        - ffmpeg_check.rc != 0
+
+    - name: Create output directory for processed videos
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+        - not (dry_run | bool)
+
+    - name: Discover video prefixes from synced files
+      set_fact:
+        discovered_prefixes: "{{ files_found.files | map(attribute='path') | map('basename') | map('regex_replace', '_[0-9]+\\.mp4$', '') | unique | list }}"
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+        - video_prefixes | length == 0
+      delegate_to: localhost
+
+    - name: Use specified video prefixes
+      set_fact:
+        prefixes_to_process: "{{ video_prefixes if video_prefixes is not string else (video_prefixes | regex_replace(\"[\\[\\]'\\\"]\", '') | split(',')) }}"
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+        - video_prefixes | length > 0
+      delegate_to: localhost
+
+    - name: Use discovered video prefixes
+      set_fact:
+        prefixes_to_process: "{{ discovered_prefixes }}"
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+        - video_prefixes | length == 0
+      delegate_to: localhost
+
+    - name: Display video prefixes to process
+      debug:
+        msg:
+          - "=========================================="
+          - "VIDEO PROCESSING"
+          - "=========================================="
+          - "Prefixes to process: {{ prefixes_to_process | length }}"
+          - "{{ prefixes_to_process }}"
+          - "Output directory: {{ output_dir }}"
+          - "FFmpeg CRF: {{ ffmpeg_crf }}"
+          - "FFmpeg preset: {{ ffmpeg_preset }}"
+          - "=========================================="
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+      delegate_to: localhost
+
+    - name: Find and concatenate video segments by prefix
+      shell: |
+        PREFIX="{{ item }}"
+        OUTPUT_FILE="{{ output_dir }}/{{ inventory_hostname }}_${PREFIX}_{{ ansible_date_time.date }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}.mp4"
+        LIST_FILE="/tmp/ffmpeg_concat_${PREFIX}_$$.txt"
+        
+        # Find all files matching the prefix and create concat list
+        find "{{ dest_dir }}" -name "${PREFIX}_*.mp4" ! -name "*.tmp.*" -type f | sort | while read file; do
+          echo "file '$file'" >> "$LIST_FILE"
+        done
+        
+        # Check if any files were found
+        if [ ! -s "$LIST_FILE" ]; then
+          echo "No files found for prefix: $PREFIX"
+          rm -f "$LIST_FILE"
+          exit 0
+        fi
+        
+        FILE_COUNT=$(wc -l < "$LIST_FILE")
+        echo "Processing $FILE_COUNT files for prefix: $PREFIX"
+        
+        {% if not (dry_run | bool) %}
+        # Run ffmpeg
+        ffmpeg -y -f concat -safe 0 -i "$LIST_FILE" \
+          -vcodec libx264 -x264-params no-scenecut=1 \
+          -force_key_frames "0" -g 1 -an -sn \
+          -crf {{ ffmpeg_crf }} -preset {{ ffmpeg_preset }} \
+          -movflags faststart -f mp4 "$OUTPUT_FILE"
+        
+        if [ $? -eq 0 ]; then
+          echo "Successfully created: $OUTPUT_FILE"
+        else
+          echo "ERROR: Failed to create video for prefix: $PREFIX"
+          rm -f "$LIST_FILE"
+          exit 1
+        fi
+        {% else %}
+        echo "DRY RUN: Would process $FILE_COUNT files into $OUTPUT_FILE"
+        cat "$LIST_FILE"
+        {% endif %}
+        
+        # Cleanup
+        rm -f "$LIST_FILE"
+      args:
+        executable: /bin/bash
+      loop: "{{ prefixes_to_process }}"
+      register: ffmpeg_results
+      delegate_to: localhost
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+      failed_when: false
+
+    - name: Display ffmpeg processing results
+      debug:
+        msg:
+          - "Prefix: {{ item.item }}"
+          - "{{ item.stdout_lines }}"
+      loop: "{{ ffmpeg_results.results }}"
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+        - ffmpeg_results is defined
+      delegate_to: localhost
+
+    - name: Video processing summary
+      debug:
+        msg:
+          - "=========================================="
+          - "{{ 'VIDEO PROCESSING SUMMARY (DRY RUN)' if dry_run | bool else 'VIDEO PROCESSING SUMMARY' }}"
+          - "=========================================="
+          - "Prefixes processed: {{ prefixes_to_process | length }}"
+          - "Output directory: {{ output_dir }}"
+          - "{{ 'Videos would be created (dry run mode)' if dry_run | bool else 'Processing completed' }}"
+          - "=========================================="
+      when:
+        - process_videos | bool
+        - files_found.files | length > 0
+      delegate_to: localhost

@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 
 import os
-import sys
 import argparse
 import json
 import base64
-import random
 from kubernetes import client, config
-from kubernetes.config import ConfigException
 
 """
 Teknoir custom dynamic inventory script for Ansible, in Python.
@@ -103,17 +100,20 @@ class TeknoirInventory(object):
 
             # print(json.dumps(device, indent=4, sort_keys=True))
 
-            tunnel_port = str(random.randint(1024, 64511))
-            tunnel_opened = False
-            if ('remote_access' in device['subresources']['status'] and
-                'active' in device['subresources']['status']['remote_access'] and
-                'port' in device['subresources']['status']['remote_access']):
-                tunnel_opened = device['subresources']['status']['remote_access']['active']
-                tunnel_port = device['subresources']['status']['remote_access']['port']
+            if not ('remote_access' in device['subresources']['status'] and
+                    'active' in device['subresources']['status']['remote_access'] and
+                    'port' in device['subresources']['status']['remote_access']):
+                continue
+
+            tunnel_opened = device['subresources']['status']['remote_access']['active']
+            tunnel_port = device['subresources']['status']['remote_access']['port']
+
+            if not tunnel_opened:
+                continue
 
             if ('data' not in device['spec']['keys'] or
-                'username' not in device['spec']['keys']['data'] or
-                'userpassword' not in device['spec']['keys']['data']):
+                    'username' not in device['spec']['keys']['data'] or
+                    'userpassword' not in device['spec']['keys']['data']):
                 continue
 
             deadendhost = f'deadend-{namespace}.{domain}'

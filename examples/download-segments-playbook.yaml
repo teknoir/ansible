@@ -1,0 +1,40 @@
+---
+- name: download_segments
+  hosts: victra-poc-03
+
+  tasks:
+#    - name: Download segments 00
+#      ansible.builtin.synchronize:
+#        use_ssh_args: true
+#        mode: pull
+#        src: /opt/teknoir/video/segments/
+#        dest: /Volumes/VIDEOS/victra-poc-03/
+#        recursive: yes
+#        rsync_opts:
+#          - --include=nc0211-front-door-1_00*.mp4
+#          - --include=nc0211-front-door-2_00*.mp4
+#          - --exclude=*
+
+#    - name: Download segments 01
+#      ansible.builtin.synchronize:
+#        use_ssh_args: true
+#        mode: pull
+#        src: /opt/teknoir/video/segments/
+#        dest: /Volumes/VIDEOS/victra-poc-03/
+#        recursive: yes
+#        rsync_opts:
+#          - --include=nc0211-front-door-1_01*.mp4
+#          - --include=nc0211-front-door-2_01*.mp4
+#          - --exclude=*
+
+    - name: Download segments 02
+      ansible.builtin.synchronize:
+        use_ssh_args: true
+        mode: pull
+        src: /opt/teknoir/video/segments/
+        dest: /Volumes/VIDEOS/victra-poc-03/
+        recursive: yes
+        rsync_opts:
+          - --include=nc0211-front-door-1_02*.mp4
+          - --include=nc0211-front-door-2_02*.mp4
+          - --exclude=*
