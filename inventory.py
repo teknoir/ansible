@@ -51,7 +51,7 @@ class TeknoirInventory(object):
                 'teknoir-poc-eks': 'teknoir.online',
                 'gke_teknoir_us-central1-c_teknoir-cluster': 'teknoir.cloud',
                 'gke_teknoir-poc_us-central1-c_teknoir-dev-cluster': 'teknoir.dev',
-            }.get(value, 'teknoir.online')
+            }.get(value, os.environ.get('DOMAIN', 'teknoir.online'))
         domain = get_domain(current_context['context']['cluster'])
         namespace = current_context['context'].get('namespace', os.environ.get('NAMESPACE', 'default'))
 
