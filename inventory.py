@@ -48,9 +48,10 @@ class TeknoirInventory(object):
 
         def get_domain(value):
             return {
+                'teknoir-poc-eks': 'teknoir.online',
                 'gke_teknoir_us-central1-c_teknoir-cluster': 'teknoir.cloud',
                 'gke_teknoir-poc_us-central1-c_teknoir-dev-cluster': 'teknoir.dev',
-            }.get(value, 'teknoir.cloud')
+            }.get(value, 'teknoir.online')
         domain = get_domain(current_context['context']['cluster'])
         namespace = current_context['context'].get('namespace', os.environ.get('NAMESPACE', 'default'))
 
@@ -120,7 +121,8 @@ class TeknoirInventory(object):
             deadendport = 2222
             username = self.decode(device['spec']['keys']['data']['username'])
             userpassword = self.decode(device['spec']['keys']['data']['userpassword'])
-            ppcmd = f"openssl s_client -quiet -connect {deadendhost}:{deadendport} -servername {deadendhost}"
+            # ppcmd = f"openssl s_client -quiet -connect {deadendhost}:{deadendport} -servername {deadendhost}"
+            ppcmd = f"ncat --ssl {deadendhost} {deadendport}"
             pcmd = f"ssh -o ProxyCommand='{ppcmd}' -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -i {private_key_file} -N -W %h:%p teknoir@{deadendhost} -p {deadendport}"
             inventory['_meta']['hostvars'][hostname] = {
                 'ansible_namespace': device["metadata"]["namespace"],
