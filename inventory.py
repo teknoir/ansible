@@ -33,7 +33,7 @@ class TeknoirInventory(object):
     def decode(self, s):
         return base64.b64decode(s.encode('utf-8')).decode('utf-8')
 
-    def teknoir_inventory(self):
+    def configure_kubernetes(self):
         try:
             config.load_kube_config()
             contexts, current_context = config.list_kube_config_contexts()
@@ -54,6 +54,10 @@ class TeknoirInventory(object):
                 namespace = os.environ.get('NAMESPACE', 'default')
             except config.ConfigException:
                 raise Exception("Could not configure kubernetes python client")
+        return domain, namespace
+
+    def teknoir_inventory(self):
+        domain, namespace = self.configure_kubernetes()
 
         custom_api = client.CustomObjectsApi()
         devices = custom_api.list_namespaced_custom_object(group="teknoir.org",
