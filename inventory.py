@@ -36,24 +36,24 @@ class TeknoirInventory(object):
     def teknoir_inventory(self):
         try:
             config.load_kube_config()
+            contexts, current_context = config.list_kube_config_contexts()
+            if not contexts or len(contexts) < 2:
+                raise Exception("No valid kube config contexts found")
+            def get_domain(value):
+                return {
+                    'teknoir-poc-eks': 'teknoir.online',
+                    'gke_teknoir_us-central1-c_teknoir-cluster': 'teknoir.cloud',
+                    'gke_teknoir-poc_us-central1-c_teknoir-dev-cluster': 'teknoir.dev',
+                }.get(value, os.environ.get('DOMAIN', 'teknoir.online'))
+            domain = get_domain(current_context['context']['cluster'])
+            namespace = current_context['context'].get('namespace', os.environ.get('NAMESPACE', 'default'))
         except config.ConfigException:
             try:
                 config.load_incluster_config()
+                domain = os.environ.get('DOMAIN', 'teknoir.online')
+                namespace = os.environ.get('NAMESPACE', 'default')
             except config.ConfigException:
                 raise Exception("Could not configure kubernetes python client")
-
-        contexts, current_context = config.list_kube_config_contexts()
-        if not contexts or len(contexts) < 2:
-            raise Exception("No valid kube config contexts found")
-
-        def get_domain(value):
-            return {
-                'teknoir-poc-eks': 'teknoir.online',
-                'gke_teknoir_us-central1-c_teknoir-cluster': 'teknoir.cloud',
-                'gke_teknoir-poc_us-central1-c_teknoir-dev-cluster': 'teknoir.dev',
-            }.get(value, os.environ.get('DOMAIN', 'teknoir.online'))
-        domain = get_domain(current_context['context']['cluster'])
-        namespace = current_context['context'].get('namespace', os.environ.get('NAMESPACE', 'default'))
 
         custom_api = client.CustomObjectsApi()
         devices = custom_api.list_namespaced_custom_object(group="teknoir.org",
