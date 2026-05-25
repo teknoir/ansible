@@ -74,8 +74,9 @@ class TeknoirInventory(object):
         for device in devices['items']:
             ansible_group = device["metadata"]["namespace"].replace('-', '_').replace('.', '_')
 
-            home_dir = os.path.expanduser("~")
-            inventory_path = os.path.join(home_dir, ".ansible", "tmp", "inv", ansible_group)
+            # home_dir = os.path.expanduser("~")
+            # inventory_path = os.path.join(home_dir, ".ansible", "tmp", "inv", ansible_group)
+            inventory_path = os.path.join("/tmp", ".ansible", "inv", ansible_group)
             hostname = f'{device["metadata"]["name"]}'
 
             if ansible_group not in inventory:
