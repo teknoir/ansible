@@ -1,17 +1,36 @@
 # Teknoir Ansible Inventory Plugin
-The easiest way to start off is to clone and run the install script:
+The easiest way to start off is to run the install script:
 ```bash
-./install.sh
+curl -sSL https://raw.githubusercontent.com/teknoir/ansible/main/install.sh | bash
 ```
 
 > Ofc you need to have Ansible installed!
-> ... and kubernetes python packages
+> ... and `PyYAML`, `requests` python packages
 
 ## Limitations
 * As namespaces/labels become groups, and Ansible do not support namespaces/labels with dashes(-).
   * Dashes(-) will be replaced with underscores(_), remember that when using them!!!
-* You have to set kubectl context before running ansible commands.
 * Start tunneling for the device manually, and disable tunneling when done, all from the teknoir cloud console.
+
+## Authentication & Context
+This plugin uses the credentials and context managed by the `tnctl` CLI tool.
+
+### Login
+Log in to the Teknoir platform:
+```bash
+tnctl login --domain <domain>
+```
+__Where `<domain>` is the domain you want to login to, e.g. `teknoir.cloud`__
+
+### Set Domain & Namespace
+The inventory will use the active domain and namespace set in `tnctl`.
+```bash
+# Switch Domain
+tnctl domain
+
+# Switch Namespace
+tnctl ns
+```
 
 ## Namespaces & labels become ansible groups
 To see all ansible groups use the inventory command below.
@@ -68,5 +87,10 @@ ansible-playbook -v -i inventory.py test-playbook.yaml --limit <label>
 ```
 
 # CHANGELOG
+## 2026-06-09
+* Refactored inventory plugin to use `tnctl` context and OAuth2 credentials.
+* Removed `kubernetes` dependency; added `PyYAML` and `requests`.
+* Updated documentation to reflect `tnctl` integration.
+
 ## 2024-09-08
 * Removed become=yes from inventory.py, so it is possible to run synchronize module, but it also means that you are no longer able to run commands that require sudo by default.
