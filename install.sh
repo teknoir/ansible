@@ -60,7 +60,7 @@ install_teknoir_ansible_user() {
 install_teknoir_ansible_system() {
   mkdir -p /etc/ansible
   cp ansible_system.cfg /etc/ansible/ansible.cfg
-  cp inventory.py /etc/ansible/inventory.py
+  cp inventory_system.py /etc/ansible/inventory.py
   chmod +x /etc/ansible/inventory.py
 }
 
