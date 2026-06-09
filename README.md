@@ -88,6 +88,9 @@ ansible-playbook -v -i inventory.py test-playbook.yaml --limit <label>
 
 # CHANGELOG
 ## 2026-06-09
+* Fixed `install.sh` interactivity when run via `curl | bash`.
+* Improved `install.sh` confirmation message to reflect installation target.
+* Added "Advanced Installation" section to `README.md`.
 * Refactored inventory plugin to use `tnctl` context and OAuth2 credentials.
 * Removed `kubernetes` dependency; added `PyYAML` and `requests`.
 * Updated documentation to reflect `tnctl` integration.

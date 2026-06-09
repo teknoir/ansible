@@ -79,8 +79,18 @@ install_teknoir_ansible() {
 if [ "${TEKNOIR_FRONTEND}" = "noninteractive" ]; then
     install_teknoir_ansible
 else
-  warn "Do you want to setup Teknoir Ansible addons for \"${USER}\" in \"${HOME}/.ansible\"? [yY]"
-  read REPLY
+  if [ "${TEKNOIR_ANSIBLE_INSTALL}" = "user" ]; then
+    INSTALL_PATH="${HOME}/.ansible"
+  else
+    INSTALL_PATH="/etc/ansible"
+  fi
+
+  warn "Do you want to setup Teknoir Ansible addons for \"${USER}\" in \"${INSTALL_PATH}\"? [yY]"
+  if [ -t 0 ]; then
+    read REPLY
+  else
+    read REPLY < /dev/tty
+  fi
 
   case ${REPLY} in
     [Yy]* )
