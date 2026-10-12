@@ -1,0 +1,216 @@
+---
+# k3s CA maintenance for Teknoir devices.
+#
+# Checks (and, on request, remediates) the k3s root CA of a device. A Teknoir device uses its own
+# certificate as the root of the k3s cluster CA. Devices bootstrapped before the fix have a root
+# without the keyCertSign key usage, which k3s v1.34.12 / v1.35.9 / v1.36.5 / v1.37.1 and later refuse
+# to start with. The device is healthy until k3s is upgraded; this playbook fixes it before that.
+#
+# The device script is tn-k3s-ca.sh from teknoir/cli commit 1d61656
+# (pkg/templates/scripts/tn-k3s-ca.sh), vendored byte for byte in files/ and sha256-checked on the
+# device before it runs. See the README section "k3s CA maintenance" for usage.
+#
+#   Check only (default, changes nothing on the device but a root-only temp dir that is removed):
+#     ansible-playbook playbooks/k3s-ca.yml --limit rpi4-white-se
+#     ansible-playbook playbooks/k3s-ca.yml --limit teknoir_demo --tags check
+#
+#   Remediate (one device at a time, stops at the first failure):
+#     ansible-playbook playbooks/k3s-ca.yml --limit rpi4-white-se -e tn_k3s_ca_remediate=true
+#
+# --limit is required: the playbook refuses to run against "all".
+
+- name: K3s CA check and remediation
+  hosts: all
+  gather_facts: false
+  serial: 1
+  max_fail_percentage: 0   # a failed device stops the rollout before the next one is touched
+  any_errors_fatal: false
+  vars:
+    # Pinned device script: teknoir/cli@1d61656 pkg/templates/scripts/tn-k3s-ca.sh
+    tn_k3s_ca_src: files/tn-k3s-ca.sh
+    tn_k3s_ca_sha256: b19b66252eb2247f2ac563e963e55e2adeb327616ad06bc555c50aacb9ea3736
+    # Remediation is opt-in. Without this the playbook only checks.
+    tn_k3s_ca_remediate: false
+    # Seconds that the remediation (rotate-ca, restart) may take in total, and that k3s may take to
+    # report all nodes Ready afterwards.
+    tn_k3s_ca_remediate_timeout: 1800
+    tn_k3s_ca_ready_timeout: 600
+    # Deployment (namespace/name) that must be Ready after a remediation. Empty = skip.
+    tn_k3s_ca_toe_deployment: kube-system/toe
+    tn_k3s_ca_k3s_bin: k3s
+
+  tasks:
+    - name: Refuse to run without --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Pass --limit <device|group>. This playbook never runs against every device."
+        quiet: true
+      tags: [always]
+
+    - name: K3s CA of the device
+      block:
+        - name: Create a root-only temp dir for the script
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: tn-k3s-ca.
+          become: true
+          register: tn_tmp
+          tags: [check, remediate]
+
+        - name: Copy the pinned script
+          ansible.builtin.copy:
+            src: "{{ tn_k3s_ca_src }}"
+            dest: "{{ tn_tmp.path }}/tn-k3s-ca.sh"
+            owner: root
+            group: root
+            mode: "0700"
+          become: true
+          tags: [check, remediate]
+
+        - name: Verify the sha256 of the script on the device
+          ansible.builtin.stat:
+            path: "{{ tn_tmp.path }}/tn-k3s-ca.sh"
+            checksum_algorithm: sha256
+          become: true
+          register: tn_script
+          failed_when: tn_script.stat.checksum | default('') != tn_k3s_ca_sha256
+          tags: [check, remediate]
+
+        - name: Check the k3s root CA
+          ansible.builtin.command: sh {{ tn_tmp.path }}/tn-k3s-ca.sh check
+          become: true
+          register: tn_check
+          changed_when: false
+          failed_when: false
+          tags: [check, remediate]
+
+        - name: State of the k3s root CA
+          ansible.builtin.set_fact:
+            tn_ca_rc: "{{ tn_check.rc }}"
+            tn_ca_reason: "{{ (tn_check.stdout_lines | default([]) | last | default(tn_check.stderr | default('') | trim)) }}"
+          tags: [check, remediate]
+
+        - name: Report
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: rc={{ tn_ca_rc }} {{ tn_ca_reason }}"
+          tags: [check, remediate]
+
+        # rc 0 ok, 2 needs rotation. 1 is an error, 3 (needs regeneration: k3s never finished its first
+        # start) and 4 (foreign CA / no server data) are not something this playbook changes.
+        # A plain check reports 3 and 4 and goes on to the next device; a remediation stops on them.
+        - name: Stop on a state that cannot be handled
+          ansible.builtin.fail:
+            msg: "{{ inventory_hostname }}: tn-k3s-ca.sh check rc={{ tn_ca_rc }}: {{ tn_ca_reason }} (nothing was changed)"
+          when: >-
+            tn_ca_rc | int == 1 or
+            (tn_k3s_ca_remediate | bool and tn_ca_rc | int not in [0, 2])
+          tags: [check, remediate]
+
+        # Started in the background and polled as root: a k3s restart on a Raspberry Pi can take minutes
+        # and may drop the SSH tunnel. The job file lives in the root-only temp dir.
+        - name: Start the remediation of the k3s root CA (re-issue with keyCertSign, rotate-ca, restart)
+          ansible.builtin.command: sh {{ tn_tmp.path }}/tn-k3s-ca.sh remediate
+          become: true
+          register: tn_job
+          async: "{{ tn_k3s_ca_remediate_timeout }}"
+          poll: 0
+          changed_when: true
+          when: tn_k3s_ca_remediate | bool and tn_ca_rc | int == 2
+          vars:
+            ansible_async_dir: "{{ tn_tmp.path }}/async"
+          tags: [remediate]
+
+        - name: Wait for the remediation to finish
+          ansible.builtin.async_status:
+            jid: "{{ tn_job.ansible_job_id }}"
+          become: true
+          register: tn_remediate
+          until: tn_remediate.finished | default(false)
+          retries: "{{ (tn_k3s_ca_remediate_timeout / 15) | int }}"
+          delay: 15
+          ignore_unreachable: true
+          failed_when: tn_remediate.finished | default(false) and tn_remediate.rc | default(1) != 0
+          when: tn_job is not skipped
+          vars:
+            ansible_async_dir: "{{ tn_tmp.path }}/async"
+          tags: [remediate]
+
+        - name: Output of the remediation
+          ansible.builtin.debug:
+            msg: "{{ (tn_remediate.stdout_lines | default([])) + (tn_remediate.stderr_lines | default([])) }}"
+          when: tn_job is not skipped
+          tags: [remediate]
+
+        - name: The remediation finished
+          ansible.builtin.assert:
+            that: tn_remediate.finished | default(false)
+            fail_msg: >-
+              {{ inventory_hostname }}: no result from the remediation within {{ tn_k3s_ca_remediate_timeout }}s.
+              It may still be running; check k3s and run the playbook without remediate to see the state.
+            quiet: true
+          when: tn_job is not skipped
+          tags: [remediate]
+
+        - name: K3s is active
+          ansible.builtin.systemd:
+            name: k3s
+          become: true
+          register: tn_active
+          until: tn_active.status.ActiveState | default('') == 'active'
+          retries: "{{ (tn_k3s_ca_ready_timeout / 10) | int }}"
+          delay: 10
+          when: tn_remediate is not skipped
+          tags: [remediate]
+
+        - name: All nodes are Ready
+          ansible.builtin.command: >-
+            {{ tn_k3s_ca_k3s_bin }} kubectl get nodes
+            -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+          become: true
+          register: tn_nodes
+          until: tn_nodes.rc == 0 and (tn_nodes.stdout_lines | length) > 0 and (tn_nodes.stdout_lines | unique) == ['True']
+          retries: "{{ (tn_k3s_ca_ready_timeout / 10) | int }}"
+          delay: 10
+          changed_when: false
+          when: tn_remediate is not skipped
+          tags: [remediate]
+
+        - name: Check again, the root must be acceptable now
+          ansible.builtin.command: sh {{ tn_tmp.path }}/tn-k3s-ca.sh check
+          become: true
+          register: tn_recheck
+          changed_when: false
+          failed_when: tn_recheck.rc != 0
+          when: tn_remediate is not skipped
+          tags: [remediate]
+
+        - name: The TOE deployment is Ready
+          ansible.builtin.command: >-
+            {{ tn_k3s_ca_k3s_bin }} kubectl -n {{ tn_k3s_ca_toe_deployment.split('/')[0] }}
+            get deployment {{ tn_k3s_ca_toe_deployment.split('/')[1] }}
+            -o jsonpath='{.spec.replicas}/{.status.readyReplicas}'
+          become: true
+          register: tn_toe
+          until: tn_toe.rc == 0 and tn_toe.stdout.split('/')[0] == tn_toe.stdout.split('/')[1]
+          retries: "{{ (tn_k3s_ca_ready_timeout / 10) | int }}"
+          delay: 10
+          changed_when: false
+          when: tn_remediate is not skipped and tn_k3s_ca_toe_deployment | length > 0
+          tags: [remediate]
+
+        - name: Result
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}:
+              {{ 'remediated, k3s Ready, check rc=0' if tn_remediate is defined and tn_remediate is not skipped
+                 else ('ok, nothing to do' if tn_ca_rc | int == 0 else 'NOT remediated (check only): ' ~ tn_ca_reason) }}
+          tags: [check, remediate]
+
+      always:
+        - name: Remove the temp dir with the script
+          ansible.builtin.file:
+            path: "{{ tn_tmp.path }}"
+            state: absent
+          become: true
+          when: tn_tmp is defined and tn_tmp.path is defined
+          tags: [check, remediate]
