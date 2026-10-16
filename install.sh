@@ -4,6 +4,14 @@ set -e
 
 export TEKNOIR_ANSIBLE_INSTALL=${TEKNOIR_ANSIBLE_INSTALL:-"user"}
 
+# DEPRECATED: the inventory plugin (inventory.py) is replaced by tnctl, which is the Ansible inventory itself:
+#   tnctl ansible <pattern> -m ping
+#   tnctl ansible-playbook <playbook> --limit <device|group>
+# See https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md
+# The user install below only runs with TEKNOIR_ANSIBLE_LEGACY=1. The system install
+# (TEKNOIR_ANSIBLE_INSTALL=system, used by the JupyterLab notebook image) still works until the
+# notebook image ships tnctl.
+
 # --- helper functions for logs ---
 info()
 {
@@ -75,6 +83,15 @@ install_teknoir_ansible() {
     install_teknoir_ansible_system
   fi
 }
+
+warn "The Teknoir Ansible inventory plugin is deprecated. Use tnctl as the inventory instead:"
+warn "  tnctl ansible <pattern> -m ping"
+warn "  tnctl ansible-playbook <playbook> --limit <device|group>"
+warn "  https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md"
+if [ "${TEKNOIR_ANSIBLE_INSTALL}" = "user" ] && [ "${TEKNOIR_ANSIBLE_LEGACY:-}" != "1" ]; then
+  info "Nothing installed. Set TEKNOIR_ANSIBLE_LEGACY=1 to install the deprecated plugin anyway."
+  exit 0
+fi
 
 if [ "${TEKNOIR_FRONTEND}" = "noninteractive" ]; then
     install_teknoir_ansible

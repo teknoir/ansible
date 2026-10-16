@@ -12,6 +12,13 @@ import datetime
 Teknoir custom dynamic inventory script for Ansible, in Python.
 """
 
+# DEPRECATED: use tnctl as the inventory (`tnctl ansible`, `tnctl ansible-playbook`,
+# `tnctl ansible-inventory`). See https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md
+import sys  # noqa: E402
+print("[DEPRECATED] The Teknoir Ansible inventory plugin is replaced by tnctl: "
+      "tnctl ansible / tnctl ansible-playbook (https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md)",
+      file=sys.stderr)
+
 
 class TeknoirInventory(object):
 

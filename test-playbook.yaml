@@ -19,6 +19,7 @@
     - name: Copy ansible dir to remote host
       ansible.builtin.synchronize:
         use_ssh_args: true
+        verify_host: true
         src: ./
         dest: /home/{{ ansible_user }}/tmp/ansible/
         recursive: yes
@@ -34,6 +35,7 @@
     - name: Copy ansible dir back to local
       ansible.builtin.synchronize:
         use_ssh_args: true
+        verify_host: true
         src: /home/{{ ansible_user }}/tmp/ansible/
         dest: ./tmp/ansible/
         recursive: yes

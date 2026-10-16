@@ -2,10 +2,10 @@
 # ==============================================================================
 # Ansible Playbook: sync_videos_by_age_rsync.yml
 # Description: Sync video files based on age using rsync from remote host to local
-# Usage: ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit <host>
-#        ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit <host> -e "max_age_minutes=10"
-#        ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit <host> -e "dry_run=true"
-#        ansible-playbook sync_videos_by_age_rsync.yml -i inventory.py --limit victra-poc-02 \
+# Usage: tnctl ansible-playbook sync_videos_by_age_rsync.yml --limit <host>
+#        tnctl ansible-playbook sync_videos_by_age_rsync.yml --limit <host> -e "max_age_minutes=10"
+#        tnctl ansible-playbook sync_videos_by_age_rsync.yml --limit <host> -e "dry_run=true"
+#        tnctl ansible-playbook sync_videos_by_age_rsync.yml --limit victra-poc-02 \
 #         -e "max_age_minutes=5" \
 #         -e "source_dir=/opt/teknoir/video/segments" \
 #         -e "video_prefixes=['nc0009-pos','nc0009-height-strip','nc0009-salefloor-0','nc0009-salefloor-90','nc0009-salefloor-180','nc0009-salefloor-270']"
@@ -182,6 +182,7 @@
     - name: Sync files using rsync with filter
       synchronize:
         use_ssh_args: true
+        verify_host: true
         src: "{{ source_dir }}/"
         dest: "{{ dest_dir }}/"
         mode: pull

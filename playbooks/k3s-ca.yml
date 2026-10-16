@@ -11,11 +11,11 @@
 # device before it runs. See the README section "k3s CA maintenance" for usage.
 #
 #   Check only (default, changes nothing on the device but a root-only temp dir that is removed):
-#     ansible-playbook playbooks/k3s-ca.yml --limit rpi4-white-se
-#     ansible-playbook playbooks/k3s-ca.yml --limit teknoir_demo --tags check
+#     tnctl ansible-playbook playbooks/k3s-ca.yml --limit rpi4-white-se
+#     tnctl ansible-playbook playbooks/k3s-ca.yml --limit teknoir_demo --tags check
 #
 #   Remediate (one device at a time, stops at the first failure):
-#     ansible-playbook playbooks/k3s-ca.yml --limit rpi4-white-se -e tn_k3s_ca_remediate=true
+#     tnctl ansible-playbook playbooks/k3s-ca.yml --limit rpi4-white-se -e tn_k3s_ca_remediate=true
 #
 # --limit is required: the playbook refuses to run against "all".
 
