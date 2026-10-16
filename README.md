@@ -7,6 +7,12 @@ curl -sSL https://raw.githubusercontent.com/teknoir/ansible/main/install.sh | ba
 > Ofc you need to have Ansible installed!
 > ... and `PyYAML`, `requests` python packages
 
+With `ansible-core` only, also install the collections the playbooks use (`ansible.posix` for `synchronize`,
+`community.general` for the `debug` stdout callback in `ansible.cfg`):
+```bash
+ansible-galaxy collection install -r requirements.yml
+```
+
 ## Limitations
 * As namespaces/labels become groups, and Ansible do not support namespaces/labels with dashes(-).
   * Dashes(-) will be replaced with underscores(_), remember that when using them!!!
@@ -121,8 +127,8 @@ The temp dir is always removed. A re-run on a fixed device is a no-op.
 The devices must have remote access (tunnel) switched on in the Teknoir console, see Limitations. Test the
 playbook on a virtual device or a VM first.
 
-> The shipped `ansible.cfg` sets `stdout_callback = debug`, which needs the `community.general` collection.
-> With `ansible-core` alone use `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default`.
+> The shipped `ansible.cfg` sets `stdout_callback = debug`, which needs the `community.general` collection
+> (`requirements.yml`). Without it use `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default`.
 
 ## Re-bootstrap a device
 `playbooks/rebootstrap-device.yml` re-runs the Teknoir bootstrap on a device that already runs Teknoir, with the
