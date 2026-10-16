@@ -189,9 +189,10 @@ Drop `--check` to apply, run it twice to see the second run change nothing, and 
 `kubectl --context k3d-teknoir-dev label node <node> teknoir.org/node-role- teknoir.org/robot- teknoir.org/gpu-` and
 `annotate node <node> teknoir.org/node-role-labels- teknoir.org/node-role-taints-`.
 
-### join-robot-agent.yml: re-bootstrap a device as a k3s agent (UNTESTED: run on a VM first)
-> **Untested.** The playbook is syntax-checked and linted, and its preflight and its device script were exercised in a
-> sandbox, but it has never joined a real node. It **deletes the k3s of the device** it runs on. Run it on a VM first.
+### join-robot-agent.yml: re-bootstrap a device as a k3s agent (VM-tested)
+> **VM-tested, not yet run on a real device.** It passed the VM steps below on two Debian 13 VMs (2026-10-16, k3s
+> v1.34.5+k3s1). It **deletes the k3s of the device** it runs on: have another way in for the first real device. Use an IP
+> that is a node IP of the server in `server_url` (it is in the apiserver certificate), not a `.local` name.
 
 Turns a device that is its own single-node robot into an agent node of the robot that runs on another device (for
 example the io computer `rpi4-8gb-black-se` joining `mobile-01`, whose server is `orin-agx-32gb-se`). The role is chosen

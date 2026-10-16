@@ -1,7 +1,9 @@
----
-# UNTESTED: RUN ON A VM FIRST. This playbook has only been syntax-checked and linted; it has never run
-# against a device. It WIPES the k3s of a computer. Do not point it at a real device before a VM run
-# (a server VM and an agent VM, see the README) has gone through, fresh and as a re-run.
+# VM-TESTED (2026-10-16, two Debian 13 VMs, k3s v1.34.5+k3s1: --check, refusal without confirm_wipe, wrong
+# server_url and taken node name stopped in the preflight, fresh join incl. config backup, re-run is a no-op,
+# a pod with nodeSelector teknoir.org/node-role=io ran on the new node, label-node-role.yml relabelled it from the
+# server). It has not run on a real device yet. It WIPES the k3s of a computer: have another way in
+# (console, LAN) for the first real device. Use an IP in server_url that is a node IP of the server (it is in the
+# apiserver certificate); a .local name only works if it is in the server's tls-san.
 #
 # Re-bootstrap a device as a k3s AGENT of another device's cluster (a multi-node robot): the device
 # stops being its own single-node robot and becomes a node of the robot that runs on robot_server.
@@ -59,7 +61,7 @@
 #
 # --limit is required: the playbook never runs against every device.
 
-- name: Join a device to a robot as a k3s agent (untested, run on a VM first)
+- name: Join a device to a robot as a k3s agent (VM-tested, wipes the k3s of the device)
   hosts: all
   gather_facts: false
   serial: 1
