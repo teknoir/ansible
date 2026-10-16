@@ -6,7 +6,7 @@
 # The device keeps everything it has: its key pair in /etc/teknoir (the k3s root CA and the
 # identity TOE authenticates to MQTT with), k3s and its workloads. The playbook
 #   1. reads the key pair and the apps TOE applied from the old platform (the top-level objects
-#      labelled teknoir.org/managed-by=devstudio) from the device,
+#      marked teknoir.org/managed-by=devstudio or device-controller) from the device,
 #   2. creates the Device in the teamspace with those keys and spec.manifest.apps rebuilt from
 #      the apps, so TOE does not prune them when it syncs the new Device,
 #   3. restarts TOE once the platform knows the device and waits for its MQTT connection.
@@ -66,7 +66,7 @@
       no_log: true
 
     # teknoir.org/managed-by is an annotation (sometimes a label): no selector, adopt_device.py filters.
-    - name: Read the apps TOE applied (teknoir.org/managed-by=devstudio)
+    - name: Read the apps TOE applied (teknoir.org/managed-by=devstudio or device-controller)
       ansible.builtin.command: >-
         k3s kubectl get helmcharts.helm.cattle.io,deployments,daemonsets,statefulsets,services,configmaps,secrets,persistentvolumeclaims
         -A -o json
