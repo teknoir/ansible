@@ -1,0 +1,128 @@
+---
+# Adopt a device that already runs Teknoir (k3s + TOE) into a platform that does not know it,
+# for example after the platform cluster was rebuilt (staging moved from r415 to vpro on
+# 2026-10-16) or the Device was deleted by mistake.
+#
+# The device keeps everything it has: its key pair in /etc/teknoir (the k3s root CA and the
+# identity TOE authenticates to MQTT with), k3s and its workloads. The playbook
+#   1. reads the key pair and the apps TOE applied from the old platform (the top-level objects
+#      labelled teknoir.org/managed-by=devstudio) from the device,
+#   2. creates the Device in the teamspace with those keys and spec.manifest.apps rebuilt from
+#      the apps, so TOE does not prune them when it syncs the new Device,
+#   3. restarts TOE once the platform knows the device and waits for its MQTT connection.
+# Re-bootstrapping instead (tnctl bootstrap) would give the device new keys, which means a k3s
+# CA rotation; adoption avoids that.
+#
+# The device is not in the platform inventory yet, so it is addressed directly:
+#   ansible-playbook -i rpi4-white-se.local, playbooks/adopt-device.yml -u anders \
+#     -e device_name=rpi4-white-se -e device_board=raspberry-pi \
+#     -e kube_context=vpro [-e device_namespace=teknoir-demo] [-e tunnel=true] \
+#     [-e '{"device_labels": {"device-group": "test"}}']
+#
+# Needs: passwordless sudo on the device (or --ask-become-pass), kubectl with a context that may
+# create Devices (cluster admin), python3 on the controller. Refuses to replace an existing
+# Device (delete it first if that is really wanted). Never prints a key.
+
+- name: Adopt an existing Teknoir device
+  hosts: all
+  gather_facts: false
+  serial: 1
+  vars:
+    device_namespace: teknoir-demo
+    device_board: generic
+    device_labels: {}
+    tunnel: true
+    kube_context: ""
+    toe_ready_timeout: 300
+  tasks:
+    - name: Check the required variables
+      ansible.builtin.assert:
+        that:
+          - device_name is defined and device_name | length > 0
+          - kube_context | length > 0
+        fail_msg: "Pass -e device_name=<device> -e kube_context=<context of the platform cluster>."
+        quiet: true
+
+    - name: The Device must not exist yet
+      ansible.builtin.command:
+        argv: [kubectl, --context, "{{ kube_context }}", -n, "{{ device_namespace }}", get, device,
+               "{{ device_name }}", --ignore-not-found, -o, name]
+      delegate_to: localhost
+      register: existing
+      changed_when: false
+      failed_when: existing.rc != 0 or existing.stdout | length > 0
+
+    - name: TOE runs on the device
+      ansible.builtin.command: k3s kubectl -n kube-system get deploy toe -o name
+      become: true
+      changed_when: false
+
+    - name: Read the device key pair
+      ansible.builtin.slurp:
+        src: "/etc/teknoir/{{ item }}"
+      loop: [rsa_private.pem, rsa_public.pem]
+      become: true
+      register: keys
+      no_log: true
+
+    # teknoir.org/managed-by is an annotation (sometimes a label): no selector, adopt_device.py filters.
+    - name: Read the apps TOE applied (teknoir.org/managed-by=devstudio)
+      ansible.builtin.command: >-
+        k3s kubectl get helmcharts.helm.cattle.io,deployments,daemonsets,statefulsets,services,configmaps,secrets,persistentvolumeclaims
+        -A -o json
+      become: true
+      register: objects
+      changed_when: false
+      no_log: true
+
+    - name: Build the Device
+      ansible.builtin.command:
+        argv: [python3, "{{ playbook_dir }}/files/adopt_device.py"]
+        stdin: >-
+          {{ {'name': device_name, 'namespace': device_namespace, 'board': device_board,
+              'labels': device_labels,
+              'tunnel_port': (range(1025, 65535) | random(seed=device_name)) if (tunnel | bool) else none,
+              'rsa_private': keys.results[0].content | b64decode,
+              'rsa_public': keys.results[1].content | b64decode,
+              'objects': objects.stdout | from_json} | to_json }}
+      delegate_to: localhost
+      register: built
+      changed_when: false
+      no_log: true
+
+    - name: Apps that will be kept on the device
+      ansible.builtin.debug:
+        msg: "{{ (built.stdout | from_json).apps }}"
+
+    - name: Create the Device
+      ansible.builtin.command:
+        argv: [kubectl, --context, "{{ kube_context }}", create, -f, "-"]
+        stdin: "{{ (built.stdout | from_json).device | to_json }}"
+      delegate_to: localhost
+      no_log: true
+
+    - name: Wait for the device-controller to publish the device key (JWKS)
+      ansible.builtin.command:
+        argv: [kubectl, --context, "{{ kube_context }}", -n, "{{ device_namespace }}", get, device,
+               "{{ device_name }}", -o, "jsonpath={.spec.manifest.apps}"]
+      delegate_to: localhost
+      register: reconciled
+      until: "'reverse-tunnel' in reconciled.stdout or not (tunnel | bool)"
+      retries: 30
+      delay: 10
+      changed_when: false
+      no_log: true
+
+    - name: Restart TOE so it reconnects now
+      ansible.builtin.command: k3s kubectl -n kube-system rollout restart deploy/toe
+      become: true
+
+    - name: Wait for TOE's MQTT connection to the platform
+      ansible.builtin.shell: >-
+        k3s kubectl -n kube-system logs deploy/toe --since=10m | grep -q 'MQTTCloud.*mqtt connection up'
+      become: true
+      register: toe_up
+      until: toe_up.rc == 0
+      retries: "{{ (toe_ready_timeout | int / 10) | int }}"
+      delay: 10
+      changed_when: false
