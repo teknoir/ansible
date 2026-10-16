@@ -1,0 +1,243 @@
+---
+# Node roles: set the role labels (and optional taints) of a k3s node.
+#
+# A node role is a set of k3s node labels, so workloads can be assigned to it with a nodeSelector:
+#   teknoir.org/node-role=<role>      always
+#   teknoir.org/robot=<robot>         always
+#   <extra_labels>                    from the robot type, for example teknoir.org/gpu=nvidia
+# and, for a dedicated computer, taints ({key, value, effect}).
+#
+# The right moment to set them is the bootstrap: k3s applies node-label / node-taint (config.yaml)
+# when the node registers, and `tnctl bootstrap` is meant to write them. This playbook is for a
+# device that is ALREADY a k3s server (a single-node robot, or the server of a multi-node robot) and
+# for the other nodes of its robot (node_name=<node>), whose labels the server can set too.
+# Labels set here live in the node object: they survive a restart of k3s, but not a deleted node
+# that registers again.
+#
+# It runs `k3s kubectl` ON the device, so it needs sudo there (the inventory pipes the device
+# password to become). Nothing in it is secret; there is no_log only where a secret could appear
+# (see join-robot-agent.yml).
+#
+#   ansible-playbook playbooks/label-node-role.yml --limit vision-station-01 \
+#     -e node_role=vision -e robot=vision-station-01 \
+#     -e '{"extra_labels": {"teknoir.org/gpu": "nvidia"}}'
+#
+#   # Only look (kubectl --dry-run=server for the real change; nothing is written):
+#   ansible-playbook playbooks/label-node-role.yml --limit mobile-01 --check \
+#     -e node_role=io -e robot=mobile-01 -e node_name=rpi4-8gb-black-se
+#
+#   # A dedicated node: taint it, and tidy up what an earlier run set
+#   ansible-playbook playbooks/label-node-role.yml --limit mobile-01 -e node_role=vision -e robot=mobile-01 \
+#     -e '{"taints": [{"key": "teknoir.org/node-role", "value": "vision", "effect": "NoSchedule"}]}' \
+#     -e remove_stale=true
+#
+# Variables
+#   node_role      required  the role, a label value: vision, io, ...
+#   robot          required  the robot the node belongs to, a label value
+#   node_name      default: the control-plane node (teknoir-master if there are several; fails if it
+#                  cannot be told). Pass it to label another node of the robot.
+#   extra_labels   dict, default {}. Values are strings (quote true/false). Keys under kubernetes.io/
+#                  and k8s.io/ are refused, as at bootstrap.
+#   taints         list of {key, value, effect}, default []. Effect: NoSchedule, PreferNoSchedule,
+#                  NoExecute. value may be empty.
+#   remove_stale   default false. Without it the playbook only adds and changes. With it, labels and
+#                  taints that an earlier run set (it records their keys in the node annotations
+#                  teknoir.org/node-role-labels and teknoir.org/node-role-taints) and that are not
+#                  wanted now are removed, plus the labels in stale_labels. Anything else on the node,
+#                  including labels from the bootstrap, is never touched.
+#   stale_labels   list of label keys that remove_stale=true removes too (for labels that were set
+#                  by something other than this playbook, for example by the bootstrap).
+#   kubectl_cmd    default [k3s, kubectl]; use_become default true. To try the playbook on a cluster
+#                  you can reach from the controller, see the README ("Try it on a throwaway k3d").
+#
+# --limit is required: the variables are per node, so the playbook never runs against every device.
+# Check mode (--check) prints the plan and runs kubectl with --dry-run=server; it changes nothing.
+
+- name: Set the node role labels of a k3s node
+  hosts: all
+  gather_facts: false
+  serial: 1
+  vars:
+    node_name: ""
+    node_role: ""
+    robot: ""
+    extra_labels: {}
+    taints: []
+    remove_stale: false
+    stale_labels: []
+    kubectl_cmd: [k3s, kubectl]
+    use_become: true
+    nr_default_server: teknoir-master
+    nr_ann_labels: teknoir.org/node-role-labels
+    nr_ann_taints: teknoir.org/node-role-taints
+
+  tasks:
+    - name: Refuse to run without --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Pass --limit <device>. This playbook never runs against every device."
+        quiet: true
+
+    - name: Check the role variables
+      ansible.builtin.include_tasks: tasks/check-role-vars.yml
+
+    - name: Find the control-plane node
+      ansible.builtin.command:
+        argv: "{{ kubectl_cmd + ['get', 'nodes', '-l', 'node-role.kubernetes.io/control-plane', '-o', 'name'] }}"
+      become: "{{ use_become }}"
+      register: nr_cp_nodes
+      changed_when: false
+      check_mode: false   # read only: runs in check mode too
+      when: node_name | length == 0
+
+    - name: Pick the node
+      ansible.builtin.set_fact:
+        nr_node: >-
+          {{ node_name if node_name | length > 0
+             else (nr_cp_names[0] if nr_cp_names | length == 1
+                   else (nr_default_server if nr_default_server in nr_cp_names else '')) }}
+      vars:
+        nr_cp_names: "{{ nr_cp_nodes.stdout_lines | default([]) | map('regex_replace', '^node/', '') | list }}"
+
+    - name: A node was found
+      ansible.builtin.assert:
+        that: nr_node | default('', true) | length > 0
+        fail_msg: >-
+          Cannot tell which node to label (control-plane nodes: {{ nr_cp_nodes.stdout_lines | default([]) | join(' ') }}).
+          Pass -e node_name=<node>.
+        quiet: true
+
+    - name: Read the node
+      ansible.builtin.command:
+        argv: "{{ kubectl_cmd + ['get', 'node', nr_node, '-o', 'json'] }}"
+      become: "{{ use_become }}"
+      register: nr_node_json
+      changed_when: false
+      check_mode: false
+
+    # Everything is worked out in one template so that it reads top to bottom:
+    #   labels   set what differs from the node; remove (remove_stale only) what an earlier run set and
+    #            is not wanted now, plus stale_labels;
+    #   taints   same, compared as key:effect -> value;
+    #   records  the keys this playbook manages go in two node annotations, which is how remove_stale
+    #            knows what is "ours".
+    # The result is JSON: set_labels, rm_labels, patch (merge patch for labels and annotations, or null),
+    # taint_args (kubectl taint arguments), result_labels, changed.
+    - name: Work out the changes
+      ansible.builtin.set_fact:
+        nr_plan: >-
+          {%- set node = nr_node_json.stdout | from_json -%}
+          {%- set cur_labels = node.metadata.labels | default({}) -%}
+          {%- set cur_ann = node.metadata.annotations | default({}) -%}
+          {%- set want = {nr_label_role: node_role, nr_label_robot: robot} -%}
+          {%- for k, v in extra_labels.items() -%}{%- set _ = want.update({k: v | string}) -%}{%- endfor -%}
+          {%- set prev_l = (cur_ann[nr_ann_labels] | default('')).split(',') | select | list -%}
+          {%- set prev_t = (cur_ann[nr_ann_taints] | default('')).split(',') | select | list -%}
+          {%- set set_l = {} -%}
+          {%- for k, v in want.items() -%}
+          {%- if cur_labels.get(k) != v -%}{%- set _ = set_l.update({k: v}) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set rm_l = [] -%}
+          {%- if remove_stale | bool -%}
+          {%- for k in (prev_l + stale_labels) | unique -%}
+          {%- if k not in want and k in cur_labels -%}{%- set _ = rm_l.append(k) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- set want_t = {} -%}
+          {%- for t in taints -%}
+          {%- set _ = want_t.update({t.key ~ ':' ~ t.effect: (t.value | default('')) | string}) -%}
+          {%- endfor -%}
+          {%- set cur_t = {} -%}
+          {%- for t in node.spec.taints | default([]) -%}
+          {%- set _ = cur_t.update({t.key ~ ':' ~ t.effect: (t.value | default('')) | string}) -%}
+          {%- endfor -%}
+          {%- set taint_args = [] -%}
+          {%- for ke, v in want_t.items() -%}
+          {%- if cur_t.get(ke) != v -%}
+          {%- set _ = taint_args.append((ke.split(':')[0] ~ '=' ~ v ~ ':' ~ ke.split(':')[1]) if v else ke) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if remove_stale | bool -%}
+          {%- for ke in prev_t -%}
+          {%- if ke not in want_t and ke in cur_t -%}{%- set _ = taint_args.append(ke ~ '-') -%}{%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- set next_l = (want.keys() | list + ([] if remove_stale | bool else prev_l)) | unique | sort | join(',') -%}
+          {%- set next_t = (want_t.keys() | list + ([] if remove_stale | bool else prev_t)) | unique | sort | join(',') -%}
+          {%- set ann = {} -%}
+          {%- if next_l != cur_ann.get(nr_ann_labels, '') -%}{%- set _ = ann.update({nr_ann_labels: next_l}) -%}{%- endif -%}
+          {%- if next_t != cur_ann.get(nr_ann_taints, '') -%}
+          {%- set _ = ann.update({nr_ann_taints: (next_t if next_t else none)}) -%}
+          {%- endif -%}
+          {%- set lab = {} -%}
+          {%- for k, v in set_l.items() -%}{%- set _ = lab.update({k: v}) -%}{%- endfor -%}
+          {%- for k in rm_l -%}{%- set _ = lab.update({k: none}) -%}{%- endfor -%}
+          {%- set meta = {} -%}
+          {%- if lab -%}{%- set _ = meta.update({'labels': lab}) -%}{%- endif -%}
+          {%- if ann -%}{%- set _ = meta.update({'annotations': ann}) -%}{%- endif -%}
+          {%- set result = {} -%}
+          {%- for k, v in cur_labels.items() -%}{%- if k not in rm_l -%}{%- set _ = result.update({k: v}) -%}{%- endif -%}{%- endfor -%}
+          {%- for k, v in set_l.items() -%}{%- set _ = result.update({k: v}) -%}{%- endfor -%}
+          {{ {'set_labels': set_l, 'rm_labels': rm_l, 'taint_args': taint_args,
+              'patch': ({'metadata': meta} if meta else none), 'result_labels': result,
+              'changed': (meta | length > 0 or taint_args | length > 0)} | to_json }}
+
+    - name: Plan
+      ansible.builtin.set_fact:
+        nr_p: "{{ nr_plan | from_json }}"
+
+    - name: Show the plan
+      ansible.builtin.debug:
+        msg: >-
+          {%- set node = nr_node_json.stdout | from_json -%}
+          {%- set cur = node.metadata.labels | default({}) -%}
+          {%- set out = ['node ' ~ nr_node ~ (' (check mode, nothing is written)' if ansible_check_mode else '')] -%}
+          {%- for k, v in nr_p.set_labels.items() -%}
+          {%- set _ = out.append(('~ label ' ~ k ~ ': ' ~ cur[k] ~ ' -> ' ~ v) if k in cur else ('+ label ' ~ k ~ '=' ~ v)) -%}
+          {%- endfor -%}
+          {%- for k in nr_p.rm_labels -%}{%- set _ = out.append('- label ' ~ k) -%}{%- endfor -%}
+          {%- for a in nr_p.taint_args -%}
+          {%- set _ = out.append(('- taint ' ~ a[:-1]) if a.endswith('-') else ('+ taint ' ~ a)) -%}
+          {%- endfor -%}
+          {%- if not nr_p.changed -%}{%- set _ = out.append('nothing to change') -%}{%- endif -%}
+          {{ out }}
+
+    # One merge patch for labels and the two annotations. In check mode the very same command runs with
+    # --dry-run=server (the API server validates and answers, nothing is stored), so check_mode is off
+    # for the task; the flag is what keeps it harmless.
+    - name: Patch the labels and annotations
+      ansible.builtin.command:
+        argv: >-
+          {{ kubectl_cmd + ['patch', 'node', nr_node, '--type', 'merge', '-p', nr_p.patch | to_json]
+             + (['--dry-run=server'] if ansible_check_mode else []) }}
+      become: "{{ use_become }}"
+      check_mode: false
+      changed_when: true
+      when: nr_p.patch is not none
+
+    - name: Set and remove the taints
+      ansible.builtin.command:
+        argv: >-
+          {{ kubectl_cmd + ['taint', 'node', nr_node] + nr_p.taint_args + ['--overwrite']
+             + (['--dry-run=server'] if ansible_check_mode else []) }}
+      become: "{{ use_become }}"
+      check_mode: false
+      changed_when: true
+      when: nr_p.taint_args | length > 0
+
+    - name: Read the node again
+      ansible.builtin.command:
+        argv: "{{ kubectl_cmd + ['get', 'node', nr_node, '-o', 'json'] }}"
+      become: "{{ use_become }}"
+      register: nr_after
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Resulting labels of {{ nr_node }}
+      ansible.builtin.debug:
+        msg: "{{ (nr_after.stdout | from_json).metadata.labels if not ansible_check_mode else nr_p.result_labels }}"
+
+    - name: Resulting taints of {{ nr_node }}
+      ansible.builtin.debug:
+        msg: "{{ (nr_after.stdout | from_json).spec.taints | default([]) if not ansible_check_mode else 'see the plan above' }}"

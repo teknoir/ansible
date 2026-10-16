@@ -1,0 +1,372 @@
+# VM-TESTED (2026-10-16, two Debian 13 VMs, k3s v1.34.5+k3s1: --check, refusal without confirm_wipe, wrong
+# server_url and taken node name stopped in the preflight, fresh join incl. config backup, re-run is a no-op,
+# a pod with nodeSelector teknoir.org/node-role=io ran on the new node, label-node-role.yml relabelled it from the
+# server). It has not run on a real device yet. It WIPES the k3s of a computer: have another way in
+# (console, LAN) for the first real device. Use an IP in server_url that is a node IP of the server (it is in the
+# apiserver certificate); a .local name only works if it is in the server's tls-san.
+#
+# Re-bootstrap a device as a k3s AGENT of another device's cluster (a multi-node robot): the device
+# stops being its own single-node robot and becomes a node of the robot that runs on robot_server.
+#
+#   ansible-playbook playbooks/join-robot-agent.yml --limit rpi4-8gb-black-se \
+#     -e robot_server=orin-agx-32gb-se -e server_url=https://orin-agx-32gb-se.local:6443 \
+#     -e node_role=io -e robot=mobile-01 -e confirm_wipe=yes
+#
+# The node role is chosen HERE, at registration: k3s applies node-label / node-taint only when the
+# node registers, so the playbook writes them into the agent's /etc/rancher/k3s/config.yaml before the
+# first start (the same thing `tnctl bootstrap` is meant to do, and the same labels as
+# label-node-role.yml: teknoir.org/node-role=<role>, teknoir.org/robot=<robot>, extra_labels, taints).
+#
+# Steps (the device the playbook runs on is the future agent; robot_server is the existing server):
+#   1. Preflight, nothing is changed: reads the server's k3s release and node token (the token is never
+#      printed, it is held in a no_log variable and handed to the device in a root-only file), checks
+#      that the agent can reach server_url, that the node name is free on the server, and what runs on
+#      the agent now. A device that already is an agent of server_url is reported and left alone.
+#   2. Needs confirm_wipe=yes if the device has a k3s of its own: it is uninstalled, which deletes its
+#      cluster: /var/lib/rancher/k3s, the kubelet state, the containers and the workloads in them
+#      (including the TOE of the device, and a tunnel that runs in that k3s).
+#   3. Downloads the k3s installer to a root-only temp dir, and starts tn-join-agent.sh DETACHED: backs
+#      up the k3s config to /root/k3s-pre-join.<time>, uninstalls the old k3s, writes the config, runs
+#      the installer (INSTALL_K3S_VERSION = the release of the server, so the kubelet is never newer
+#      than the apiserver; k3s_version overrides it).
+#   4. Waits on the SERVER until the node is Ready and has its role labels, and prints them.
+#
+# Kept on the device: /etc/teknoir (its key pair, its Teknoir identity). Not done here: the Teknoir
+# Device object of this computer in the platform. The robot's server runs TOE for the whole robot, so
+# decide separately (in the platform) what happens to the Device of the computer that became a node.
+#
+# The device may become unreachable from the controller while this runs and afterwards: if its tunnel
+# runs inside the k3s that is removed, nothing brings it back. That is why step 4 looks from the server
+# and why you should have another way in (console, LAN) for the first real device.
+#
+# Needs: passwordless sudo or the device password in the inventory (as the other playbooks), both
+# devices in the inventory (robot_server too, with remote access on), the agent can reach
+# server_url (6443/tcp) and the installer URL (the device needs internet, this is not the airgapped
+# path). The become password of robot_server comes from the inventory: the first task that is
+# delegated to it tells you at once if that does not work.
+#
+# Variables
+#   robot_server   required  inventory name of the server device
+#   server_url     required  https://<address of the server as the agent sees it>:6443
+#   node_role      required  the role of the new node: vision, io, ...
+#   robot          required  the robot (label teknoir.org/robot)
+#   node_name      default: the inventory name of this device
+#   extra_labels, taints   as in label-node-role.yml
+#   confirm_wipe   must be "yes" when the device has a k3s now
+#   k3s_version    default: the release of the server (vX.Y.Z+k3sN)
+#   k3s_install_url   default https://get.k3s.io
+#   join_timeout   seconds to wait for the node to be Ready (default 600)
+#   server_kubectl, use_become   [k3s, kubectl] and true; only changed to try the preflight (README)
+#   Check mode (--check) runs the preflight and prints what would happen; it changes nothing.
+#
+# --limit is required: the playbook never runs against every device.
+
+- name: Join a device to a robot as a k3s agent (VM-tested, wipes the k3s of the device)
+  hosts: all
+  gather_facts: false
+  serial: 1
+  max_fail_percentage: 0
+  vars:
+    robot_server: ""
+    server_url: ""
+    node_name: "{{ inventory_hostname }}"
+    node_role: ""
+    robot: ""
+    extra_labels: {}
+    taints: []
+    stale_labels: []
+    confirm_wipe: "no"
+    k3s_version: ""
+    k3s_install_url: https://get.k3s.io
+    join_timeout: 600
+    server_kubectl: [k3s, kubectl]
+    use_become: true
+    ja_token_file: /var/lib/rancher/k3s/server/node-token
+
+  tasks:
+    - name: Refuse to run without --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Pass --limit <device>. This playbook never runs against every device."
+        quiet: true
+
+    - name: Check the role variables
+      ansible.builtin.include_tasks: tasks/check-role-vars.yml
+
+    - name: Check the join variables
+      ansible.builtin.assert:
+        that:
+          - robot_server | length > 0
+          - robot_server != inventory_hostname
+          - robot_server in hostvars
+          - server_url is match('^https://[^/ ]+:[0-9]+$')
+          - node_name | length > 0 and node_name | length <= 63
+          - node_name is match('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')
+        fail_msg: >-
+          Pass -e robot_server=<inventory name of the server device, not this one> and
+          -e server_url=https://<address>:6443. node_name must be a DNS name (lower case).
+        quiet: true
+
+    # ---- preflight: nothing here changes anything -------------------------------------------------
+    - name: The server's k3s release (this also proves that become works on the delegated host)
+      ansible.builtin.command: k3s --version
+      delegate_to: "{{ robot_server }}"
+      become: "{{ use_become }}"
+      register: ja_server_version
+      changed_when: false
+      check_mode: false
+
+    - name: The server's node token (never printed)
+      ansible.builtin.slurp:
+        src: "{{ ja_token_file }}"
+      delegate_to: "{{ robot_server }}"
+      become: "{{ use_become }}"
+      register: ja_token
+      no_log: true
+      check_mode: false
+
+    - name: The nodes the server knows
+      ansible.builtin.command:
+        argv: "{{ server_kubectl + ['get', 'nodes', '-o', 'name'] }}"
+      delegate_to: "{{ robot_server }}"
+      become: "{{ use_become }}"
+      register: ja_nodes
+      changed_when: false
+      check_mode: false
+
+    - name: What runs on this device now
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /usr/local/bin/k3s
+        - /usr/local/bin/k3s-uninstall.sh
+        - /usr/local/bin/k3s-agent-uninstall.sh
+        - /etc/systemd/system/k3s-agent.service.env
+      become: "{{ use_become }}"
+      register: ja_stat
+      check_mode: false
+
+    - name: Is it an agent of this server already
+      ansible.builtin.command:
+        argv: [grep, -q, -F, "K3S_URL='{{ server_url }}'", /etc/systemd/system/k3s-agent.service.env]
+      become: "{{ use_become }}"
+      register: ja_joined_grep
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: ja_stat.results[3].stat.exists
+
+    - name: Cgroup version of this device
+      ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+      register: ja_cgroup
+      changed_when: false
+      check_mode: false
+
+    - name: Work out what to do
+      ansible.builtin.set_fact:
+        ja_server_release: >-
+          {{ k3s_version if k3s_version | length > 0
+             else ja_server_version.stdout | regex_search('v[0-9]+[.][0-9]+[.][0-9]+[+]k3s[0-9]+') }}
+        ja_joined: "{{ ja_joined_grep.rc | default(1) == 0 }}"
+        ja_has_k3s: >-
+          {{ ja_stat.results[0].stat.exists or ja_stat.results[1].stat.exists
+             or ja_stat.results[2].stat.exists }}
+        ja_cgroup_v1: "{{ ja_cgroup.stdout != 'cgroup2fs' }}"
+        ja_node_exists: "{{ ('node/' ~ node_name) in ja_nodes.stdout_lines }}"
+        # k3s node-label / node-taint, applied by k3s when the node registers
+        ja_label_list: >-
+          {%- set o = [nr_label_role ~ '=' ~ node_role, nr_label_robot ~ '=' ~ robot] -%}
+          {%- for k, v in extra_labels.items() -%}{%- set _ = o.append(k ~ '=' ~ (v | string)) -%}{%- endfor -%}
+          {{ o | to_json }}
+        ja_taint_list: >-
+          {%- set o = [] -%}
+          {%- for t in taints -%}
+          {%- set v = (t.value | default('')) | string -%}
+          {%- set _ = o.append(t.key ~ ('=' ~ v if v else '') ~ ':' ~ t.effect) -%}
+          {%- endfor -%}
+          {{ o | to_json }}
+
+    - name: The release is known
+      ansible.builtin.assert:
+        that: ja_server_release | length > 0
+        fail_msg: "Cannot read the k3s release of {{ robot_server }} ({{ ja_server_version.stdout }}). Pass -e k3s_version=vX.Y.Z+k3sN."
+        quiet: true
+
+    - name: The node name is free on the server
+      ansible.builtin.assert:
+        that: ja_joined or not ja_node_exists
+        fail_msg: >-
+          {{ robot_server }} already has a node called {{ node_name }}. Delete it on the server first
+          (k3s kubectl delete node {{ node_name }}; and its secret {{ node_name }}.node-password.k3s in
+          kube-system) or choose another -e node_name=. The playbook does not do that for you.
+        quiet: true
+
+    - name: The agent can reach the server
+      ansible.builtin.uri:
+        url: "{{ server_url }}/cacerts"
+        validate_certs: false
+      check_mode: false
+      when: not ja_joined
+
+    - name: The k3s config of the agent
+      ansible.builtin.set_fact:
+        ja_config: >-
+          {{ {'node-name': node_name, 'node-label': ja_label_list | from_json}
+             | combine({'node-taint': ja_taint_list | from_json} if (ja_taint_list | from_json | length) > 0 else {})
+             | combine({'kubelet-arg': ['fail-cgroupv1=false']}
+                       if ja_cgroup_v1 and ja_release_number is version('1.31', '>=')
+                       else {}) }}
+      vars:
+        ja_release_number: "{{ ja_server_release | regex_replace('^v', '') | regex_replace('[+].*', '') }}"
+
+    - name: The plan
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }} becomes node {{ node_name }} of {{ robot_server }} ({{ server_url }}), k3s {{ ja_server_release }}"
+          - >-
+            {{ 'already an agent of that server: nothing to install' if ja_joined
+               else ('its own k3s is uninstalled first (needs confirm_wipe=yes)' if ja_has_k3s
+                     else 'no k3s on it now') }}
+          - "k3s config.yaml: {{ ja_config }}"
+
+    - name: Confirm the wipe
+      ansible.builtin.assert:
+        that: confirm_wipe == 'yes'
+        fail_msg: >-
+          {{ inventory_hostname }} runs a k3s of its own. Joining deletes that cluster with all its
+          workloads and data. Check the plan above, then pass -e confirm_wipe=yes.
+        quiet: true
+      when: ja_has_k3s and not ja_joined and not ansible_check_mode
+
+    # ---- the join: from here on the device is changed ---------------------------------------------
+    - name: Join
+      when: not ja_joined and not ansible_check_mode
+      block:
+        - name: Create a root-only temp dir for the join
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: tn-join.
+          become: "{{ use_become }}"
+          register: ja_tmp
+
+        - name: Download the k3s installer (before anything is removed)
+          ansible.builtin.get_url:
+            url: "{{ k3s_install_url }}"
+            dest: "{{ ja_tmp.path }}/k3s-install.sh"
+            owner: root
+            group: root
+            mode: "0700"
+          become: "{{ use_become }}"
+
+        - name: Copy the join script
+          ansible.builtin.copy:
+            src: files/tn-join-agent.sh
+            dest: "{{ ja_tmp.path }}/tn-join-agent.sh"
+            owner: root
+            group: root
+            mode: "0700"
+          become: "{{ use_become }}"
+
+        - name: Write the k3s config (node name, labels, taints)
+          ansible.builtin.copy:
+            content: "{{ ja_config | to_nice_yaml }}"
+            dest: "{{ ja_tmp.path }}/config.yaml"
+            owner: root
+            group: root
+            mode: "0600"
+          become: "{{ use_become }}"
+
+        - name: Write the join environment (holds the token)
+          ansible.builtin.copy:
+            content: |
+              K3S_URL={{ server_url | quote }}
+              K3S_TOKEN={{ (ja_token.content | b64decode | trim) | quote }}
+              INSTALL_K3S_VERSION={{ ja_server_release | quote }}
+            dest: "{{ ja_tmp.path }}/join.env"
+            owner: root
+            group: root
+            mode: "0600"
+          become: "{{ use_become }}"
+          no_log: true
+
+        # Detached: the connection can go away when the old k3s does (the tunnel may run in it).
+        - name: Start the join (uninstall the old k3s, configure, install the agent)
+          ansible.builtin.command:
+            argv: ["{{ ja_tmp.path }}/tn-join-agent.sh", "{{ ja_tmp.path }}"]
+          become: "{{ use_become }}"
+          async: 3600
+          poll: 0
+          changed_when: true
+
+        - name: Wait for the node to be Ready (looking from the server)
+          ansible.builtin.command:
+            argv: >-
+              {{ server_kubectl + ['get', 'node', node_name, '-o',
+                 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'] }}
+          delegate_to: "{{ robot_server }}"
+          become: "{{ use_become }}"
+          register: ja_ready
+          until: ja_ready.rc == 0 and ja_ready.stdout == 'True'
+          retries: "{{ (join_timeout | int / 10) | int }}"
+          delay: 10
+          changed_when: false
+
+        # The device's tunnel ran in the k3s that was just removed, so it may be unreachable now (seen on the
+        # first real join, rpi4-8gb-black-se, 2026-10-16: the task hung). The token file is already gone (the
+        # script deletes join.env on exit); what is left is the root-only installer and config, no secret.
+        - name: Remove the temp dir of the join (the device may be unreachable now)
+          ansible.builtin.file:
+            path: "{{ ja_tmp.path }}"
+            state: absent
+          become: "{{ use_become }}"
+          ignore_unreachable: true
+          ignore_errors: true  # noqa: ignore-errors
+          timeout: 60
+
+      rescue:
+        # The log has no secret in it (the token only lives in join.env, which the script deletes).
+        - name: What the device says (if it is reachable)
+          ansible.builtin.shell: >-
+            cat {{ ja_tmp.path | default('/nonexistent') | quote }}/status;
+            tail -n 40 {{ ja_tmp.path | default('/nonexistent') | quote }}/install.log
+          become: "{{ use_become }}"
+          register: ja_devlog
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+
+        - name: The join did not finish
+          ansible.builtin.fail:
+            msg: >-
+              {{ node_name }} is not Ready on {{ robot_server }}. Device status and installer log:
+              {{ ja_devlog.stdout_lines | default(['(device not reachable)']) }}.
+              The temp dir {{ ja_tmp.path | default('?') }} on the device was kept.
+
+    # ---- the result (also for a device that was an agent of the server already) -------------------
+    - name: Read the node on the server
+      ansible.builtin.command:
+        argv: "{{ server_kubectl + ['get', 'node', node_name, '-o', 'json'] }}"
+      delegate_to: "{{ robot_server }}"
+      become: "{{ use_become }}"
+      register: ja_node
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: The node has its role labels
+      ansible.builtin.assert:
+        that:
+          - (ja_node.stdout | from_json).metadata.labels[nr_label_role] | default('') == node_role
+          - (ja_node.stdout | from_json).metadata.labels[nr_label_robot] | default('') == robot
+        fail_msg: >-
+          {{ node_name }} joined, but its role labels are not as asked. k3s applies node-label only at
+          registration; set them now with playbooks/label-node-role.yml on {{ robot_server }}
+          (-e node_name={{ node_name }}).
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Labels and taints of the new node
+      ansible.builtin.debug:
+        msg:
+          labels: "{{ (ja_node.stdout | from_json).metadata.labels }}"
+          taints: "{{ (ja_node.stdout | from_json).spec.taints | default([]) }}"
+      when: not ansible_check_mode
