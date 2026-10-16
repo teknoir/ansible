@@ -311,11 +311,17 @@
           delay: 10
           changed_when: false
 
-        - name: Remove the temp dir of the join
+        # The device's tunnel ran in the k3s that was just removed, so it may be unreachable now (seen on the
+        # first real join, rpi4-8gb-black-se, 2026-10-16: the task hung). The token file is already gone (the
+        # script deletes join.env on exit); what is left is the root-only installer and config, no secret.
+        - name: Remove the temp dir of the join (the device may be unreachable now)
           ansible.builtin.file:
             path: "{{ ja_tmp.path }}"
             state: absent
           become: "{{ use_become }}"
+          ignore_unreachable: true
+          ignore_errors: true  # noqa: ignore-errors
+          timeout: 60
 
       rescue:
         # The log has no secret in it (the token only lives in join.env, which the script deletes).

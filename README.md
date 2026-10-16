@@ -153,15 +153,15 @@ For a device that already is a k3s server (a single-node robot, or the server of
 nodes of that robot (`node_name=`, the server sets their labels too). It runs `k3s kubectl` on the device.
 
 ```bash
-ansible-playbook -i inventory.py playbooks/label-node-role.yml --limit vision-station-01 \
+tnctl -d teknoir.cloud -n teknoir-demo ansible-playbook playbooks/label-node-role.yml --limit rtx2000-ada-128gb-se \
   -e node_role=vision -e robot=vision-station-01 -e '{"extra_labels": {"teknoir.org/gpu": "nvidia"}}'
 
 # the io node of a multi-node robot, labelled from its server (--limit is the server device)
-ansible-playbook -i inventory.py playbooks/label-node-role.yml --limit mobile-01 \
-  -e node_role=io -e robot=mobile-01 -e node_name=rpi4-8gb-black-se
+tnctl -d teknoir.cloud -n teknoir-demo ansible-playbook playbooks/label-node-role.yml --limit orin-agx-32gb-se \
+  -e node_role=io -e robot=mobile-01 -e node_name=mobile-01-io
 
 # only look: prints the plan and runs kubectl with --dry-run=server, nothing is written
-ansible-playbook -i inventory.py playbooks/label-node-role.yml --limit mobile-01 --check -e node_role=io -e robot=mobile-01
+tnctl -d teknoir.cloud -n teknoir-demo ansible-playbook playbooks/label-node-role.yml --limit orin-agx-32gb-se --check -e node_role=vision -e robot=mobile-01
 ```
 
 | Variable | |
@@ -200,8 +200,8 @@ here, at registration: the playbook writes `node-name`, `node-label` and `node-t
 `/etc/rancher/k3s/config.yaml` before the first start.
 
 ```bash
-ansible-playbook -i inventory.py playbooks/join-robot-agent.yml --limit rpi4-8gb-black-se \
-  -e robot_server=orin-agx-32gb-se -e server_url=https://orin-agx-32gb-se.local:6443 \
+tnctl -d teknoir.cloud -n teknoir-demo ansible-playbook playbooks/join-robot-agent.yml --limit rpi4-8gb-black-se \
+  -e robot_server=orin-agx-32gb-se -e server_url=https://192.168.2.51:6443 -e node_name=mobile-01-io \
   -e node_role=io -e robot=mobile-01 -e confirm_wipe=yes
 ```
 
