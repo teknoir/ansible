@@ -132,6 +132,111 @@ that k3s is active, the TOE deployment is Ready, and that the platform user has 
 holds no password for it.
 `--limit` is required. Test on a VM or virtual device first.
 
+## Node roles
+A node role is a set of k3s node labels (and optional taints), so workloads can be assigned to the nodes that fill
+the role with a plain `nodeSelector`:
+
+| Label | Value |
+| --- | --- |
+| `teknoir.org/node-role` | the role, for example `vision` (GPU: vision models, NVR) or `io` (cameras, sensors, control) |
+| `teknoir.org/robot` | the robot the node belongs to |
+| the role's extra labels | from the robot type, for example `teknoir.org/gpu=nvidia` |
+
+**The role is chosen when the node registers.** k3s applies `node-label` / `node-taint` (in
+`/etc/rancher/k3s/config.yaml`) at registration, so the place to choose it is the bootstrap (`tnctl bootstrap`). The two
+playbooks cover what the bootstrap does not: a device that already runs k3s, and joining a device to another robot.
+Labels set with `kubectl` live in the node object: they survive a restart of k3s, but not a node that is deleted and
+registers again.
+
+### label-node-role.yml: set the role of a node that exists
+For a device that already is a k3s server (a single-node robot, or the server of a multi-node robot), and for the other
+nodes of that robot (`node_name=`, the server sets their labels too). It runs `k3s kubectl` on the device.
+
+```bash
+ansible-playbook -i inventory.py playbooks/label-node-role.yml --limit vision-station-01 \
+  -e node_role=vision -e robot=vision-station-01 -e '{"extra_labels": {"teknoir.org/gpu": "nvidia"}}'
+
+# the io node of a multi-node robot, labelled from its server (--limit is the server device)
+ansible-playbook -i inventory.py playbooks/label-node-role.yml --limit mobile-01 \
+  -e node_role=io -e robot=mobile-01 -e node_name=rpi4-8gb-black-se
+
+# only look: prints the plan and runs kubectl with --dry-run=server, nothing is written
+ansible-playbook -i inventory.py playbooks/label-node-role.yml --limit mobile-01 --check -e node_role=io -e robot=mobile-01
+```
+
+| Variable | |
+| --- | --- |
+| `node_role`, `robot` | required (label values) |
+| `node_name` | default: the control-plane node (`teknoir-master` if there are several) |
+| `extra_labels` | dict; quote `true`/`false`; keys under `kubernetes.io/` and `k8s.io/` are refused, as at bootstrap |
+| `taints` | list of `{key, value, effect}`, effect `NoSchedule`, `PreferNoSchedule` or `NoExecute` |
+| `remove_stale` | default `false`: only adds and changes. `true` also removes labels and taints that an earlier run set and that are not wanted now (the playbook records the keys it sets in the node annotations `teknoir.org/node-role-labels` and `teknoir.org/node-role-taints`), plus the labels in `stale_labels` |
+| `stale_labels` | extra label keys that `remove_stale=true` removes (for labels that something else set, for example the bootstrap) |
+
+It is idempotent (a second run reports `changed=0`), never touches a label it did not set unless you say so, and ends by
+printing the resulting labels and taints. `--limit` is required.
+
+**Try it on a throwaway cluster** (no device needed): the playbook only needs a `kubectl` it can run, so point it at the
+local k3d cluster and run it on localhost without sudo:
+
+```bash
+ansible-playbook -i localhost, -c local --limit localhost playbooks/label-node-role.yml \
+  -e use_become=false -e '{"kubectl_cmd": ["kubectl", "--context", "k3d-teknoir-dev"]}' \
+  -e node_role=vision -e robot=vision-station-01 -e '{"extra_labels": {"teknoir.org/gpu": "nvidia"}}' --check
+```
+
+Drop `--check` to apply, run it twice to see the second run change nothing, and clean up with
+`kubectl --context k3d-teknoir-dev label node <node> teknoir.org/node-role- teknoir.org/robot- teknoir.org/gpu-` and
+`annotate node <node> teknoir.org/node-role-labels- teknoir.org/node-role-taints-`.
+
+### join-robot-agent.yml: re-bootstrap a device as a k3s agent (UNTESTED: run on a VM first)
+> **Untested.** The playbook is syntax-checked and linted, and its preflight and its device script were exercised in a
+> sandbox, but it has never joined a real node. It **deletes the k3s of the device** it runs on. Run it on a VM first.
+
+Turns a device that is its own single-node robot into an agent node of the robot that runs on another device (for
+example the io computer `rpi4-8gb-black-se` joining `mobile-01`, whose server is `orin-agx-32gb-se`). The role is chosen
+here, at registration: the playbook writes `node-name`, `node-label` and `node-taint` into the agent's
+`/etc/rancher/k3s/config.yaml` before the first start.
+
+```bash
+ansible-playbook -i inventory.py playbooks/join-robot-agent.yml --limit rpi4-8gb-black-se \
+  -e robot_server=orin-agx-32gb-se -e server_url=https://orin-agx-32gb-se.local:6443 \
+  -e node_role=io -e robot=mobile-01 -e confirm_wipe=yes
+```
+
+What it does: reads the server's k3s release and node token (never printed: a `no_log` variable, handed to the device in a
+root-only file that is removed afterwards), checks that the agent can reach `server_url` and that the node name is free on
+the server, **stops without `confirm_wipe=yes`** if the device has a k3s of its own, downloads the installer first, and then
+starts `files/tn-join-agent.sh` detached: back up the k3s config to `/root/k3s-pre-join.<time>`, uninstall the old k3s,
+write the config, install `k3s agent` at the server's release (a kubelet must not be newer than its apiserver). It then waits
+on the **server** until the node is Ready and has its labels, and prints them. A device that already is an agent of
+`server_url` is left alone. `--check` runs the preflight only.
+
+Things to know before the first real run: the device keeps `/etc/teknoir` but loses the TOE and any tunnel that ran in its
+old k3s, so it can become unreachable from the platform (have another way in); the Teknoir Device object of that computer
+is not handled here; the device needs internet access for the k3s installer (this is not the airgapped path).
+
+**VM test steps** (nothing here needs a real device): two VMs from the VM rig (`infra/airgap/test/vm/`, or any two Debian
+VMs with internet), a *server* (bootstrap it as a server, node name `teknoir-master`) and an *agent* (bootstrap it as its own
+server first, so there is a k3s to wipe), both in the inventory (or a static `-i vm-server,vm-agent` inventory with
+`ansible_user`).
+1. `--check` against the agent: the plan and the config.yaml are printed, nothing changes.
+2. Without `confirm_wipe=yes`: the run stops before touching the agent.
+3. With `confirm_wipe=yes`: the agent VM becomes node `<node_name>`, Ready on the server, with `teknoir.org/node-role` and
+   `teknoir.org/robot`; `kubectl get nodes -L teknoir.org/node-role` on the server shows it; a pod with
+   `nodeSelector: {teknoir.org/node-role: io}` lands on it.
+4. Run it again: the agent is reported as joined, nothing changes.
+5. A wrong `server_url` or an existing node name must stop in the preflight, before the agent is wiped.
+Also confirm that `become` works for the tasks that are delegated to `robot_server` (the first one tells at once) and that
+the unmodified `tn-join-agent.sh` can be replaced by `tnctl bootstrap` for agents once that writes the role (preferred).
+
+### Checks
+```bash
+yamllint playbooks/                                       # line length 140
+ansible-lint --offline playbooks/label-node-role.yml playbooks/join-robot-agent.yml   # `uv tool install ansible-lint`
+ansible-playbook -i localhost, --syntax-check playbooks/label-node-role.yml
+```
+
 ## Deprecated: the inventory plugin
 `inventory.py` (installed by `install.sh` into `~/.ansible/inventory.py` and `~/.ansible.cfg`) was the Teknoir dynamic
 inventory before tnctl took over. Use `tnctl ansible` / `tnctl ansible-playbook` instead: same login, domain and
@@ -153,6 +258,10 @@ teamspace as every other tnctl command, WireGuard where it is active, passwordle
 ## 2026-10-16
 * Added `playbooks/rebootstrap-device.yml`: re-bootstrap a device with the tnctl-generated script, run through
   tnctl as the inventory. Used on the staging devices after key-only platform users got passwordless sudo.
+
+## 2026-10-16 (3)
+* Added `playbooks/label-node-role.yml`: set the node role labels (and taints) of a k3s node, idempotent, with `--check` and `remove_stale`.
+* Added `playbooks/join-robot-agent.yml` (untested, run on a VM first): re-bootstrap a device as a k3s agent of another device's cluster, role chosen at registration.
 
 ## 2026-10-12
 * Added `playbooks/k3s-ca.yml`: check and remediate the k3s root CA of a device (no `keyCertSign`).
