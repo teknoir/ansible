@@ -1,95 +1,66 @@
-# Teknoir Ansible Inventory Plugin
-The easiest way to start off is to run the install script:
+# Teknoir Ansible playbooks
+Playbooks for host-level maintenance of Teknoir devices (OS, k3s service, files) below the Kubernetes layer. Run
+them with **tnctl as the inventory**: `tnctl ansible` and `tnctl ansible-playbook` (reference:
+[tnctl ansible](https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md)).
+
+> The Teknoir Ansible inventory plugin (`inventory.py`, `install.sh`) in this repo is **deprecated**, see
+> [Deprecated: the inventory plugin](#deprecated-the-inventory-plugin).
+
+## Setup
+1. Install [tnctl](https://github.com/teknoir/cli) and Ansible (`ansible-core` is enough).
+2. Install the collections the playbooks use:
+   ```bash
+   ansible-galaxy collection install -r requirements.yml   # ansible.posix, community.general
+   ```
+3. Sign in and pick the domain and teamspace (or pass `-d <domain> -n <namespace>` to each command):
+   ```bash
+   tnctl login --domain teknoir.cloud
+   tnctl domain
+   tnctl ns
+   ```
+
+## Inventory and groups
+`tnctl ansible-inventory --list` shows the inventory. Hosts are the devices of the teamspace that tnctl can reach:
+over WireGuard where it is enabled and active for the device, else through the SSH tunnel (enable tunneling on the
+device page). Other devices are left out, with one line on stderr each. `TNCTL_ANSIBLE_TRANSPORT=auto|wireguard|tunnel`
+picks the transport.
+
+Groups are the namespace and every device label as `<key>_<value>`; every character outside `A-Za-z0-9_` becomes `_`
+(`teknoir-demo` is `teknoir_demo`, `device-group=test` is `device_group_test`, `teknoir.org/robot=amr-01` is
+`teknoir_org_robot_amr_01`).
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/teknoir/ansible/main/install.sh | bash
-```
-
-> Ofc you need to have Ansible installed!
-> ... and `PyYAML`, `requests` python packages
-
-With `ansible-core` only, also install the collections the playbooks use (`ansible.posix` for `synchronize`,
-`community.general` for the `debug` stdout callback in `ansible.cfg`):
-```bash
-ansible-galaxy collection install -r requirements.yml
-```
-
-## Limitations
-* As namespaces/labels become groups, and Ansible do not support namespaces/labels with dashes(-).
-  * Dashes(-) will be replaced with underscores(_), remember that when using them!!!
-* Start tunneling for the device manually, and disable tunneling when done, all from the teknoir cloud console.
-
-## Authentication & Context
-This plugin uses the credentials and context managed by the `tnctl` CLI tool.
-
-### Login
-Log in to the Teknoir platform:
-```bash
-tnctl login --domain <domain>
-```
-__Where `<domain>` is the domain you want to login to, e.g. `teknoir.cloud`__
-
-### Set Domain & Namespace
-The inventory will use the active domain and namespace set in `tnctl`.
-```bash
-# Switch Domain
-tnctl domain
-
-# Switch Namespace
-tnctl ns
-```
-
-## Namespaces & labels become ansible groups
-To see all ansible groups use the inventory command below.
-
-> Dashes(-) will be replaced with underscores(_), remember that when limiting playbooks
-> Device labels are concatenated with underscore i.e. f"{key}_{value}" to create an ansible group name
-
-## Inventory
-Creates an inventory so you are able to connect to any device in any namespace.
-To see inventory run:
-```bash
-python3 inventory.py --list
-```
-
-### List devices
-```bash
-ansible -i inventory.py --list-hosts all
-```
-
-## List devices
-```bash
-ansible -i inventory.py --list-hosts <namespace>
+tnctl ansible-inventory --list
+tnctl ansible all --list-hosts
+tnctl ansible teknoir_demo --list-hosts
 ```
 
 ## Ansible commands
-Quick commands to manipulate devices
-
-### Synchronize (rsync) from host to local
 ```bash
-ansible <device_name> -m synchronize -a "src=/path/to/source/dir/ dest=/path/to/local/target/dir/ use_ssh_args=yes mode=pull"
-```
-_Synchronize does not work with "become"(sudo)_
-
-### Syncronize (rsync) from local to host
-```bash
-ansible <device_name> -m synchronize -a "src=/path/to/local/source/dir/ dest=/path/to/target/dir/ use_ssh_args=yes"
-```
-_Synchronize does not work with "become"(sudo)_
-
-## Run playbook examples
-Run for one device:
-```bash
-ansible-playbook -v -i inventory.py test-playbook.yaml --limit <device_name>
+tnctl ansible <device> -m ping
+tnctl ansible <device> -b -m command -a 'uptime'     # -b: as root
+tnctl ansible device_group_test -b -m command -a 'systemctl is-active k3s'
 ```
 
-### Run for all devices in a namespace:
+`-b` uses sudo. The device bootstrap gives the platform user passwordless sudo when the platform holds no password
+for it; otherwise the inventory supplies the platform password. Devices bootstrapped before that need one run of
+[Re-bootstrap a device](#re-bootstrap-a-device).
+
+### Synchronize (rsync)
+`synchronize` runs its own ssh for rsync: pass `use_ssh_args=yes` so it goes through tnctl's transport, and
+`verify_host=yes` so it keeps the host key check. It works with `-b` when the platform user has passwordless sudo.
 ```bash
-ansible-playbook -v -i inventory.py test-playbook.yaml --limit <namespace>
+# from the device to local
+tnctl ansible <device> -m synchronize -a "src=/path/on/device/ dest=/local/path/ mode=pull use_ssh_args=yes verify_host=yes"
+# from local to the device
+tnctl ansible <device> -m synchronize -a "src=/local/path/ dest=/path/on/device/ use_ssh_args=yes verify_host=yes"
 ```
 
-### Run for all devices with label:
+## Run playbooks
 ```bash
-ansible-playbook -v -i inventory.py test-playbook.yaml --limit <label>
+tnctl ansible-playbook -v test-playbook.yaml --limit <device>
+tnctl ansible-playbook -v test-playbook.yaml --limit <namespace_group>
+tnctl ansible-playbook -v test-playbook.yaml --limit <label_group>
 ```
 
 ## k3s CA maintenance
@@ -109,11 +80,11 @@ file and `tn_k3s_ca_sha256` in the playbook together.
 ```bash
 # Check only (default). Changes nothing on the device, the temp dir is removed.
 # --limit is required: the playbook refuses to run against "all".
-ansible-playbook -i inventory.py playbooks/k3s-ca.yml --limit <device>
-ansible-playbook -i inventory.py playbooks/k3s-ca.yml --limit <namespace> --tags check
+tnctl ansible-playbook playbooks/k3s-ca.yml --limit <device>
+tnctl ansible-playbook playbooks/k3s-ca.yml --limit <namespace> --tags check
 
 # Remediate: one device at a time (serial 1), the rollout stops at the first failure
-ansible-playbook -i inventory.py playbooks/k3s-ca.yml --limit <device> -e tn_k3s_ca_remediate=true
+tnctl ansible-playbook playbooks/k3s-ca.yml --limit <device> -e tn_k3s_ca_remediate=true
 ```
 
 What it does per device: copies the script to a root-only temp dir and verifies its sha256; runs `check`
@@ -124,11 +95,9 @@ active, `k3s kubectl get nodes` reports every node Ready (within `tn_k3s_ca_read
 returns 0 and the TOE deployment (`tn_k3s_ca_toe_deployment`, default `kube-system/toe`, empty to skip) is Ready.
 The temp dir is always removed. A re-run on a fixed device is a no-op.
 
-The devices must have remote access (tunnel) switched on in the Teknoir console, see Limitations. Test the
-playbook on a virtual device or a VM first.
+The devices must be reachable through tnctl (WireGuard or the SSH tunnel). Test the playbook on a virtual device or
+a VM first.
 
-> The shipped `ansible.cfg` sets `stdout_callback = debug`, which needs the `community.general` collection
-> (`requirements.yml`). Without it use `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default`.
 
 ## Re-bootstrap a device
 `playbooks/rebootstrap-device.yml` re-runs the Teknoir bootstrap on a device that already runs Teknoir, with the
@@ -163,7 +132,24 @@ that k3s is active, the TOE deployment is Ready, and that the platform user has 
 holds no password for it.
 `--limit` is required. Test on a VM or virtual device first.
 
+## Deprecated: the inventory plugin
+`inventory.py` (installed by `install.sh` into `~/.ansible/inventory.py` and `~/.ansible.cfg`) was the Teknoir dynamic
+inventory before tnctl took over. Use `tnctl ansible` / `tnctl ansible-playbook` instead: same login, domain and
+teamspace as every other tnctl command, WireGuard where it is active, passwordless become.
+
+- `install.sh` no longer installs it for a user unless `TEKNOIR_ANSIBLE_LEGACY=1` is set.
+- Both inventory scripts print a deprecation line on stderr.
+- `ansible.cfg` no longer names an inventory. If `~/.ansible.cfg` still has `inventory = ~/.ansible/inventory.py`,
+  remove that line (tnctl passes its own `-i`, so it is not used by `tnctl ansible`, but plain `ansible` would still
+  use it).
+- `inventory_system.py` and `ansible_system.cfg` (`TEKNOIR_ANSIBLE_INSTALL=system`) stay for the JupyterLab notebook
+  image until that image ships tnctl.
+
 # CHANGELOG
+## 2026-10-16 (2)
+* tnctl is the inventory: README rewritten for `tnctl ansible` / `tnctl ansible-playbook`; the inventory plugin
+  (`inventory.py`, `install.sh`) is deprecated.
+
 ## 2026-10-16
 * Added `playbooks/rebootstrap-device.yml`: re-bootstrap a device with the tnctl-generated script, run through
   tnctl as the inventory. Used on the staging devices after key-only platform users got passwordless sudo.

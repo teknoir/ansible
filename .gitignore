@@ -1,3 +1,4 @@
 inv
 .idea
-venv
+venvtmp/
+__pycache__/
