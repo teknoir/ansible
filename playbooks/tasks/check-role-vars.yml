@@ -1,0 +1,56 @@
+---
+# Shared by label-node-role.yml and join-robot-agent.yml: validate the role variables
+# (node_role, robot, extra_labels, taints, stale_labels) the way a Kubernetes label is validated.
+# Keys under kubernetes.io/ and k8s.io/ are refused, as `tnctl bootstrap` refuses them (the
+# NodeRestriction admission plugin does not let a kubelet label itself there).
+- name: Constants of the node role labels
+  ansible.builtin.set_fact:
+    nr_label_role: teknoir.org/node-role
+    nr_label_robot: teknoir.org/robot
+    nr_key_re: '^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$'
+    nr_value_re: '^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$'
+    nr_effects: [NoSchedule, PreferNoSchedule, NoExecute]
+
+- name: Check the variables
+  ansible.builtin.assert:
+    that:
+      - node_role | length > 0 and node_role | length <= 63 and node_role is match(nr_value_re)
+      - robot | length > 0 and robot | length <= 63 and robot is match(nr_value_re)
+      - extra_labels is mapping
+      - taints is sequence and taints is not string
+      - stale_labels is sequence and stale_labels is not string
+    fail_msg: >-
+      Pass -e node_role=<role> -e robot=<robot>. Both are label values (letters, digits, - _ .;
+      at most 63 characters). extra_labels is a dict, taints and stale_labels are lists.
+    quiet: true
+
+- name: Check extra_labels
+  ansible.builtin.assert:
+    that:
+      - item.key is match(nr_key_re)
+      - item.key not in [nr_label_role, nr_label_robot]
+      - (item.key.split('/')[0] ~ '/') is not match('^(.*[.])?(kubernetes|k8s)[.]io/$')
+      - item.value is string or item.value is number
+      - item.value is not boolean
+      - (item.value | string) | length <= 63 and (item.value | string) is match(nr_value_re)
+    fail_msg: >-
+      extra_labels key '{{ item.key }}': must be a valid Kubernetes label key and value (quote
+      true/false), not one of {{ nr_label_role }} / {{ nr_label_robot }} (set from node_role and
+      robot), and not under kubernetes.io/ or k8s.io/.
+    quiet: true
+  loop: "{{ extra_labels | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Check taints
+  ansible.builtin.assert:
+    that:
+      - item is mapping
+      - item.key is defined and item.key is match(nr_key_re)
+      - (item.value | default('') | string) is match(nr_value_re)
+      - item.effect | default('') in nr_effects
+    fail_msg: "Each taint is {key, value, effect}; effect is one of {{ nr_effects | join(', ') }}. Got: {{ item }}"
+    quiet: true
+  loop: "{{ taints }}"
+  loop_control:
+    label: "{{ item.key | default('?') }}"
