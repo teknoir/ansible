@@ -7,17 +7,23 @@
 # rotates the k3s CA: TN_K3S_CA_AUTO_REMEDIATE=false makes the script report an old CA instead
 # (fix that with playbooks/k3s-ca.yml).
 #
+# Only for a k3s server node that runs k3s with containerd (the server bootstrap script). The
+# playbook refuses agent nodes, Docker-mode k3s and devices without k3s.
+#
 # For each device, one at a time:
-#   1. `tnctl bootstrap <device> --skip-upload` renders the script on the controller, in a private
+#   1. Pre-flight on the device: a k3s server unit, no k3s agent unit, no Docker mode.
+#   2. `tnctl bootstrap <device> --skip-upload` renders the script on the controller, in a private
 #      temp dir that is removed again (the script holds the device keys).
-#   2. The playbook refuses to continue if the device certificate in the platform differs from
-#      /etc/teknoir/rsa_public.pem on the device: it is the root of the device's k3s CA, and the
-#      script would replace it. Adopt the device instead (playbooks/adopt-device.yml).
-#   3. The script runs on the device as root (CREATE_USER=true, no prompts) and is removed. Its log
+#   3. The playbook refuses to continue if the device certificate in the platform differs from
+#      /etc/teknoir/rsa_public.pem on the device, or the device has none: it is the root of the
+#      device's k3s CA, and the script would replace it. Adopt the device instead
+#      (playbooks/adopt-device.yml). -e rebootstrap_allow_missing_cert=true accepts a device
+#      without the certificate.
+#   4. The script runs on the device as root (CREATE_USER=true, no prompts) and is removed. Its log
 #      is kept in /var/log/teknoir-rebootstrap.log (root only; the script never prints a secret).
-#   4. Removes duplicate members of the users and sudo groups that older scripts left.
-#   5. Checks: k3s active, TOE Ready, and for a platform user without a password the sudoers
-#      drop-in /etc/sudoers.d/90-teknoir-<user> that gives it passwordless sudo.
+#   5. Removes duplicate members of the users and sudo groups that older scripts left.
+#   6. Checks: k3s active, TOE Ready, and the platform user's sudo: passwordless when the platform
+#      holds no password for it (the run fails otherwise).
 #
 # Uses tnctl as the inventory (`tnctl ansible-playbook`), so the domain and teamspace come from
 # tnctl. The first run on a device whose platform user still needs a sudo password connects as
@@ -27,7 +33,7 @@
 # After that the platform user works on its own:
 #   tnctl ansible-playbook playbooks/rebootstrap-device.yml --limit rpi4-white-se
 #
-# --limit is required: the playbook refuses to run against "all".
+# --limit is required: the playbook refuses to run without it.
 
 - name: Re-bootstrap a Teknoir device
   hosts: all
@@ -43,6 +49,8 @@
     rebootstrap_timeout: 1800
     rebootstrap_ready_timeout: 600
     rebootstrap_log: /var/log/teknoir-rebootstrap.log
+    rebootstrap_script: /root/teknoir-rebootstrap.sh
+    rebootstrap_allow_missing_cert: false
 
   tasks:
     - name: Refuse to run without --limit
@@ -51,7 +59,37 @@
         fail_msg: "Pass --limit <device|group>. This playbook never runs against every device."
         quiet: true
 
-    - name: Re-bootstrap
+    - name: Remove a script left by an interrupted run
+      ansible.builtin.file:
+        path: "{{ rebootstrap_script }}"
+        state: absent
+      become: true
+
+    - name: Pre-flight, the device is a k3s server node with containerd
+      ansible.builtin.shell:
+        cmd: |
+          systemctl cat k3s.service > /dev/null 2>&1 || { echo "no k3s server unit (k3s.service)"; exit 3; }
+          if systemctl cat k3s-agent.service > /dev/null 2>&1; then echo "a k3s agent node (k3s-agent.service)"; exit 4; fi
+          if systemctl cat k3s.service | grep -qE -- '(^|[[:space:]])--docker([[:space:]=]|$)' \
+            || grep -qsE '^[[:space:]]*docker:[[:space:]]*true' /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.d/*.yaml; then
+            echo "k3s in Docker mode"; exit 5
+          fi
+        executable: /bin/bash
+      become: true
+      changed_when: false
+      failed_when: false
+      register: tn_preflight
+
+    - name: The server bootstrap script fits this device
+      ansible.builtin.assert:
+        that: tn_preflight.rc == 0
+        fail_msg: >-
+          {{ rebootstrap_device }} is not a k3s server node with containerd
+          ({{ tn_preflight.stdout | default('') | trim }}). This playbook only runs the server
+          bootstrap script; re-bootstrap agent nodes and Docker-mode devices by hand.
+        quiet: true
+
+    - name: Render and check the bootstrap script
       block:
         - name: Create a private temp dir on the controller
           ansible.builtin.tempfile:
@@ -98,26 +136,71 @@
           changed_when: false
           register: tn_device_fp
 
+        - name: The device has a certificate
+          ansible.builtin.assert:
+            that: tn_device_fp.stdout | trim != '' or rebootstrap_allow_missing_cert | bool
+            fail_msg: >-
+              {{ rebootstrap_device }} has no /etc/teknoir/rsa_public.pem although k3s runs. Running the
+              script would install the platform's key as a new root of its k3s CA. Pass
+              -e rebootstrap_allow_missing_cert=true if that is what you want.
+            quiet: true
+
         - name: The platform must hold the certificate the device already has
           ansible.builtin.assert:
             that: >-
               tn_device_fp.stdout | trim == '' or
               tn_device_fp.stdout | trim == tn_platform_fp.stdout | trim
             fail_msg: >-
-              The device certificate in the platform differs from /etc/teknoir/rsa_public.pem on {{ rebootstrap_device }}.
-              Re-bootstrapping would replace the root of its k3s CA. Adopt the device instead
-              (playbooks/adopt-device.yml), which keeps the device key.
+              The device certificate in the platform differs from /etc/teknoir/rsa_public.pem on
+              {{ rebootstrap_device }}. Re-bootstrapping would replace the root of its k3s CA. Adopt
+              the device instead (playbooks/adopt-device.yml), which keeps the device key.
             quiet: true
 
-        - name: Copy the script to the device (root only)
-          ansible.builtin.copy:
-            src: "{{ tn_local.path }}/bootstrap_server_{{ rebootstrap_device }}.sh"
-            dest: /root/teknoir-rebootstrap.sh
-            owner: root
-            group: root
-            mode: "0700"
-          become: true
-          no_log: true
+        - name: Run the bootstrap script
+          block:
+            - name: Copy the script to the device (root only)
+              ansible.builtin.copy:
+                src: "{{ tn_local.path }}/bootstrap_server_{{ rebootstrap_device }}.sh"
+                dest: "{{ rebootstrap_script }}"
+                owner: root
+                group: root
+                mode: "0700"
+              become: true
+              no_log: true
+
+            - name: Run the bootstrap script (output in {{ rebootstrap_log }})
+              ansible.builtin.shell:
+                cmd: >-
+                  umask 077;
+                  env CREATE_USER=true TN_K3S_UPGRADE=false TN_K3S_CA_AUTO_REMEDIATE=false
+                  bash {{ rebootstrap_script }} > {{ rebootstrap_log }} 2>&1
+              become: true
+              async: "{{ rebootstrap_timeout }}"
+              poll: 15
+              register: tn_run
+              vars:
+                # The inventory's become flags (-E) keep the login user's HOME, so the job file and
+                # the poll would look in different home dirs. Pin it.
+                ansible_async_dir: /root/.ansible_async
+
+          always:
+            - name: Remove the script from the device
+              ansible.builtin.file:
+                path: "{{ rebootstrap_script }}"
+                state: absent
+              become: true
+
+            - name: Warnings from the run
+              ansible.builtin.command: grep -E '\[(WARN|ERROR)\]' {{ rebootstrap_log }}
+              become: true
+              changed_when: false
+              failed_when: false
+              register: tn_warnings
+
+            - name: Show the warnings
+              ansible.builtin.debug:
+                msg: "{{ tn_warnings.stdout_lines }}"
+              when: tn_warnings.stdout_lines | default([]) | length > 0
 
       always:
         - name: Remove the rendered scripts from the controller
@@ -126,42 +209,6 @@
             state: absent
           delegate_to: localhost
           when: tn_local.path is defined
-
-    - name: Run the bootstrap script
-      block:
-        - name: Run the bootstrap script (output in {{ rebootstrap_log }})
-          ansible.builtin.shell:
-            cmd: >-
-              umask 077;
-              env CREATE_USER=true TN_K3S_UPGRADE=false TN_K3S_CA_AUTO_REMEDIATE=false
-              bash /root/teknoir-rebootstrap.sh > {{ rebootstrap_log }} 2>&1
-          become: true
-          async: "{{ rebootstrap_timeout }}"
-          poll: 15
-          register: tn_run
-          vars:
-            # The inventory's become flags (-E) keep the login user's HOME, so the job file and the
-            # poll would look in different home dirs. Pin it.
-            ansible_async_dir: /root/.ansible_async
-
-      always:
-        - name: Remove the script from the device
-          ansible.builtin.file:
-            path: /root/teknoir-rebootstrap.sh
-            state: absent
-          become: true
-
-        - name: Warnings from the run
-          ansible.builtin.command: grep -E '\[(WARN|ERROR)\]' {{ rebootstrap_log }}
-          become: true
-          changed_when: false
-          failed_when: false
-          register: tn_warnings
-
-        - name: Show the warnings
-          ansible.builtin.debug:
-            msg: "{{ tn_warnings.stdout_lines }}"
-          when: tn_warnings.stdout_lines | default([]) | length > 0
 
     - name: Remove duplicate members of the users and sudo groups
       # Bootstrap scripts before teknoir/cli#19 appended the platform user to these groups on every
@@ -202,8 +249,13 @@
       failed_when: false
       register: tn_sudo
 
-    - name: Report sudo of the platform login user
-      ansible.builtin.debug:
-        msg: >-
+    - name: The platform login user has passwordless sudo when the platform holds no password
+      # The inventory sets ansible_become_pass only when the platform has a password for the user.
+      ansible.builtin.assert:
+        that: tn_sudo.rc == 0 or ansible_become_pass is defined
+        fail_msg: >-
+          {{ tn_login_user }} has no password in the platform but no passwordless sudo on
+          {{ rebootstrap_device }}; see the bootstrap warnings in {{ rebootstrap_log }}.
+        success_msg: >-
           {{ tn_login_user }}: {{ 'passwordless sudo' if tn_sudo.rc == 0
-          else 'sudo asks for the password (the platform has one for this user)' }}
+          else 'sudo asks for the password the platform holds' }}

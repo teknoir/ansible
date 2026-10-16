@@ -149,13 +149,18 @@ tnctl ansible-playbook playbooks/rebootstrap-device.yml --limit <device>
 tnctl ansible <device> -b -m command -a 'id -u'
 ```
 
+Only for a k3s server node with containerd: it refuses k3s agent nodes (devices joined to a robot with
+`join-robot-agent.yml`), Docker-mode k3s and devices without k3s.
+
 Per device (serial 1, the rollout stops at the first failure): renders the script on the controller in a private
 temp dir that is always removed (the script holds the device keys); refuses to continue when the device
-certificate in the platform differs from `/etc/teknoir/rsa_public.pem` (it is the root of the device's k3s CA; adopt
-the device with `playbooks/adopt-device.yml` instead); copies the script root-only, runs it in the background
+certificate in the platform differs from `/etc/teknoir/rsa_public.pem`, or the device has none (it is the root of the
+device's k3s CA; adopt the device with `playbooks/adopt-device.yml` instead, or pass
+`-e rebootstrap_allow_missing_cert=true`); copies the script root-only, runs it in the background
 (polled; a k3s restart may drop the connection for a while) with its output in `/var/log/teknoir-rebootstrap.log`,
 and removes it; removes duplicate members of the `users` and `sudo` groups that older scripts left; then checks
-that k3s is active, the TOE deployment is Ready, and reports whether the platform user has passwordless sudo.
+that k3s is active, the TOE deployment is Ready, and that the platform user has passwordless sudo when the platform
+holds no password for it.
 `--limit` is required. Test on a VM or virtual device first.
 
 # CHANGELOG
