@@ -1,0 +1,298 @@
+---
+# TOE image rollout: switch the image of the TOE Deployment (kube-system/toe) on a device to an
+# immutable, digest-pinned reference, and roll back.
+#
+# Why a playbook: the TOE Deployment lives in /var/lib/rancher/k3s/server/manifests/teknoir.yaml, which k3s
+# re-applies when the file changes and at start. `kubectl set image` is reverted, and the config channel
+# cannot change it (it would overwrite itself). So this playbook edits that one file:
+#   - pulls the image first (`k3s crictl pull`) and checks its digest, so an unpullable image never reaches
+#     the manifest (the watchdog reboots a device whose TOE is not Ready: an unpullable image is a reboot loop),
+#   - copies the manifest to a backup OUTSIDE the manifests directory (k3s would apply a backup inside it),
+#   - replaces only the `image:` line of the toe container (the one after `command: - /manager`) and sets
+#     `imagePullPolicy: IfNotPresent` on it (the pinned image stays in the containerd cache),
+#   - waits for the Deployment to carry the new image and `rollout status` (<= 5 min),
+#   - on failure restores the backup and waits for the old TOE to be Ready again, then fails the run,
+#   - prints the image, the imageID and the restarts of the TOE pod.
+#
+#   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 \
+#     -e toe_image=ghcr.io/teknoir/toe-app:sha-1a2b3c4d@sha256:<64 hex>
+#
+#   # Only look: prints the plan and the diff of the manifest, changes nothing (no pull, no restart)
+#   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 --check --diff -e toe_image=...
+#
+#   # Roll back: restore the newest backup (or -e toe_backup=<path>), wait for the TOE to be Ready
+#   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 -e toe_rollback=true
+#
+# Variables
+#   toe_image          required (unless toe_rollback=true): <registry>/<repo>[:<tag>]@sha256:<digest>. A reference
+#                      without a digest is refused: a moving tag is exactly what this playbook exists to avoid.
+#   toe_rollback       default false. true restores a backup instead (toe_image is not needed).
+#   toe_backup         with toe_rollback: the backup file to restore (default: the newest in toe_backup_dir).
+#   toe_wait_timeout   rollout wait in seconds, default 300.
+#   toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_crictl_cmd, toe_use_become:
+#                      where things are; the defaults fit a Teknoir device. They exist so the playbook can be tried
+#                      against a throwaway target (README).
+#
+# Backups: <toe_backup_dir>/teknoir.yaml.bak-<UTC timestamp> (default /var/lib/rancher/k3s/server/toe-image-backups).
+# Never run against a device without --limit; the run is serial 1 and stops at the first failure
+# (max_fail_percentage 0). Roll out VM first, then one device, then the rest. Production only with Anders' OK.
+
+- name: Roll the TOE image of a device (digest-pinned, with backup and rollback)
+  hosts: all
+  gather_facts: false
+  serial: 1
+  max_fail_percentage: 0
+  vars:
+    toe_image: ""
+    toe_rollback: false
+    toe_backup: ""
+    toe_wait_timeout: 300
+    toe_manifest: /var/lib/rancher/k3s/server/manifests/teknoir.yaml
+    toe_backup_dir: /var/lib/rancher/k3s/server/toe-image-backups
+    toe_namespace: kube-system
+    toe_deployment: toe
+    toe_kubectl_cmd: [k3s, kubectl]
+    toe_crictl_cmd: [k3s, crictl]
+    toe_use_become: true
+    # The toe container is the one that follows `command: - /manager`; groups: 1 prefix, 2 image, 3 middle, 4 policy.
+    toe_re: '([ ]+command:\n[ ]+- /manager\n[ ]+image: )(\S+)(\n[ ]+imagePullPolicy: )(\S+)'
+    toe_image_re: '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$'
+    toe_wait_argv: "{{ ['-n', toe_namespace, 'rollout', 'status', 'deploy/' ~ toe_deployment, '--timeout=' ~ toe_wait_timeout ~ 's'] }}"
+    toe_get_image_argv: "{{ ['-n', toe_namespace, 'get', 'deploy', toe_deployment, '-o', 'jsonpath=' ~ toe_jsonpath_image] }}"
+    toe_jsonpath_pods: >-
+      {range .items[*]}{.metadata.name} {.spec.containers[?(@.name=="toe")].image}
+      {.status.containerStatuses[?(@.name=="toe")].imageID}
+      restarts={.status.containerStatuses[?(@.name=="toe")].restartCount}{"\n"}{end}
+    toe_jsonpath_image: '{.spec.template.spec.containers[?(@.name=="toe")].image}'
+  become: "{{ toe_use_become | bool }}"
+
+  tasks:
+    - name: Refuse to run without --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Pass --limit <device>. This playbook never runs against every device."
+        quiet: true
+
+    - name: Validate the image reference
+      ansible.builtin.assert:
+        that:
+          - toe_image is string
+          - toe_image is match(toe_image_re)
+        fail_msg: >-
+          Pass -e toe_image=<registry>/<repo>[:<tag>]@sha256:<64 hex digits>. A reference without a digest is refused.
+          Got: '{{ toe_image }}'
+        quiet: true
+      when: not (toe_rollback | bool)
+
+    - name: Read the TOE manifest
+      ansible.builtin.slurp:
+        src: "{{ toe_manifest }}"
+      register: toe_file
+
+    - name: Find the toe container in the manifest
+      ansible.builtin.set_fact:
+        toe_found: "{{ (toe_file.content | b64decode) | regex_findall(toe_re, multiline=True) }}"
+
+    - name: Refuse a manifest where the toe container is not found exactly once
+      ansible.builtin.assert:
+        that: toe_found | length == 1
+        fail_msg: >-
+          {{ toe_manifest }}: expected exactly one toe container (`command: - /manager` followed by image and
+          imagePullPolicy), found {{ toe_found | length }}. Nothing was changed.
+        quiet: true
+
+    - name: Current TOE image line
+      ansible.builtin.set_fact:
+        toe_old_image: "{{ toe_found[0][1] }}"
+        toe_old_policy: "{{ toe_found[0][3] }}"
+
+    # ------------------------------------------------------------------ rollout
+    - name: Roll out the TOE image
+      when: not (toe_rollback | bool)
+      block:
+        - name: Plan
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ toe_old_image }} ({{ toe_old_policy }}) -> {{ toe_image }} (IfNotPresent){{
+              '; already in place, nothing to change' if (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent') else '' }}
+
+        - name: Pre-pull the image into containerd (never reaches the manifest unless it pulls)
+          ansible.builtin.command:
+            argv: "{{ toe_crictl_cmd + ['pull', toe_image] }}"
+          register: toe_pull
+          changed_when: false  # a pull of a cached image is not a change; the manifest edit is
+          when: not ansible_check_mode
+
+        - name: Inspect the pulled image
+          ansible.builtin.command:
+            argv: "{{ toe_crictl_cmd + ['inspecti', '-o', 'json', toe_image] }}"
+          register: toe_inspect
+          changed_when: false
+          failed_when: not ansible_check_mode and toe_inspect.rc != 0  # in check mode the image is not pulled
+          check_mode: false
+
+        - name: The image in the cache carries the requested digest
+          ansible.builtin.assert:
+            that: toe_digest in toe_have
+          vars:
+            toe_digest: "{{ toe_image | regex_replace('^.*@', '') }}"
+            toe_have: "{{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) | map('regex_replace', '^.*@', '') | list }}"
+            fail_msg: >-
+              The image in the containerd cache of {{ inventory_hostname }} does not carry the digest
+              {{ toe_image | regex_replace('^.*@', '') }} (repoDigests: {{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) }}).
+              The manifest was not changed.
+            quiet: true
+          when: not ansible_check_mode or toe_inspect.rc == 0
+
+        - name: Make the backup directory (outside the manifests directory, so k3s does not apply backups)
+          ansible.builtin.file:
+            path: "{{ toe_backup_dir }}"
+            state: directory
+            mode: "0700"
+          when: toe_old_image != toe_image or toe_old_policy != 'IfNotPresent'
+
+        - name: Back up the manifest
+          ansible.builtin.copy:
+            src: "{{ toe_manifest }}"
+            dest: "{{ toe_backup_dir }}/teknoir.yaml.bak-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+            remote_src: true
+            mode: preserve
+          register: toe_bak
+          when: (toe_old_image != toe_image or toe_old_policy != 'IfNotPresent') and not ansible_check_mode
+
+        - name: Replace the image and imagePullPolicy of the toe container only
+          ansible.builtin.replace:
+            path: "{{ toe_manifest }}"
+            regexp: '{{ toe_re }}'
+            replace: '\g<1>{{ toe_image }}\g<3>IfNotPresent'
+          register: toe_edit
+
+        - name: Wait for the Deployment to carry the new image (k3s re-applies the file)
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + toe_get_image_argv }}"
+          register: toe_cur
+          until: toe_cur.stdout == toe_image
+          retries: "{{ (toe_wait_timeout | int / 5) | int }}"
+          delay: 5
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: Wait for the rollout
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
+          changed_when: false
+          when: not ansible_check_mode
+
+      rescue:
+        - name: Failed, restore the backup (if the manifest was changed)
+          ansible.builtin.copy:
+            src: "{{ toe_bak.dest }}"
+            dest: "{{ toe_manifest }}"
+            remote_src: true
+            mode: preserve
+          when: toe_bak is defined and toe_bak.dest is defined
+
+        - name: Wait for the old TOE to be Ready again
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
+          changed_when: false
+          failed_when: false
+          register: toe_restored
+          when: toe_bak is defined and toe_bak.dest is defined
+
+        - name: Rollout failed
+          ansible.builtin.fail:
+            msg: >-
+              {{ inventory_hostname }}: the TOE rollout to {{ toe_image }} failed and the previous manifest was
+              {{ 'restored (rollout status of the old TOE rc=' ~ (toe_restored.rc | default('?')) ~ ')' if toe_bak is defined and toe_bak.dest is defined
+              else 'not touched (no backup was made)' }}.
+              The run stops here (serial 1, max_fail_percentage 0).
+
+    # ------------------------------------------------------------------ rollback
+    - name: Roll back the TOE image
+      when: toe_rollback | bool
+      block:
+        - name: Find the backups
+          ansible.builtin.find:
+            paths: "{{ toe_backup_dir }}"
+            patterns: "teknoir.yaml.bak-*"
+          register: toe_baks
+
+        - name: Choose the backup
+          ansible.builtin.set_fact:
+            toe_restore_from: >-
+              {{ toe_backup if toe_backup != '' else
+              (toe_baks.files | sort(attribute='path') | map(attribute='path') | list | last | default('')) }}
+
+        - name: Refuse without a backup
+          ansible.builtin.assert:
+            that: toe_restore_from != ''
+            fail_msg: "No backup in {{ toe_backup_dir }} and no -e toe_backup=<file>. Nothing was changed."
+            quiet: true
+
+        - name: Read the backup
+          ansible.builtin.slurp:
+            src: "{{ toe_restore_from }}"
+          register: toe_bak_file
+
+        - name: Find the toe container in the backup
+          ansible.builtin.set_fact:
+            toe_bak_found: "{{ (toe_bak_file.content | b64decode) | regex_findall(toe_re, multiline=True) }}"
+
+        - name: The backup holds exactly one toe container
+          ansible.builtin.assert:
+            that: toe_bak_found | length == 1
+            fail_msg: "{{ toe_restore_from }} does not look like the Teknoir manifest. Nothing was changed."
+            quiet: true
+
+        - name: Plan
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: restore {{ toe_restore_from }}
+              (image {{ toe_bak_found[0][1] }}) over {{ toe_manifest }} (image {{ toe_old_image }})
+
+        - name: Keep the manifest that is being replaced
+          ansible.builtin.copy:
+            src: "{{ toe_manifest }}"
+            dest: "{{ toe_backup_dir }}/teknoir.yaml.pre-rollback-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+            remote_src: true
+            mode: preserve
+
+        - name: Restore the backup
+          ansible.builtin.copy:
+            src: "{{ toe_restore_from }}"
+            dest: "{{ toe_manifest }}"
+            remote_src: true
+            mode: preserve
+
+        - name: Wait for the Deployment to carry the restored image
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + toe_get_image_argv }}"
+          register: toe_cur
+          vars:
+            toe_want: "{{ toe_bak_found[0][1] }}"
+          until: toe_cur.stdout == toe_want
+          retries: "{{ (toe_wait_timeout | int / 5) | int }}"
+          delay: 5
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: Wait for the rollout
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
+          changed_when: false
+          when: not ansible_check_mode
+
+    # ------------------------------------------------------------------ report
+    - name: Read the TOE pod
+      ansible.builtin.command:
+        argv: "{{ toe_kubectl_cmd + ['-n', toe_namespace, 'get', 'pods', '-l', 'app=toe', '-o', toe_pods_jp] }}"
+      vars:
+        toe_pods_jp: "jsonpath={{ toe_jsonpath_pods | replace('\n', ' ') | trim }}"
+      register: toe_pods
+      changed_when: false
+      check_mode: false
+
+    - name: TOE after the run
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ toe_pods.stdout_lines }}"
