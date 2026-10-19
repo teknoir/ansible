@@ -202,6 +202,8 @@ cat > "$TOE_CR" <<'J'
 J
 : > "$TOE_DIFF_LOG"
 o=$(run -e toe_image="$GOOD2"); ok "secret value is not printed" "! echo \"\$o\" | grep -q SECRETVALUE"
+o=$(run -vvv -e toe_image="$GOOD2"); ok "secret value is not printed with -vvv" "! echo \"\$o\" | grep -q SECRETVALUE"
+ok "the -vvv run did run the playbook" "echo \"\$o\" | grep -q 'Server-side dry run'"
 ok "namespaced item without a namespace is sent to default" "grep '\"name\": \"nons\"' $TOE_DIFF_LOG | grep -q '\"namespace\": \"default\"'"
 ok "status is not sent" "! grep -q '\"status\"' $TOE_DIFF_LOG"
 ok "cluster-scoped item is sent without a namespace" "! grep '\"name\": \"cr\"' $TOE_DIFF_LOG | grep -q namespace"
