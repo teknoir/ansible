@@ -161,7 +161,17 @@ device: `--limit all`, wildcards and patterns that match several devices are ref
    namespaced item has none). The old TOE returned on its first create error before pruning, so such an item may still run
    on the device, and the new TOE deletes it at once (a HelmChart is uninstalled). The run is refused unless
    `-e toe_allow_prune=true`; look first (`kubectl get toes.teknoir.org toe-config -o yaml`) or fix the device config. A re-run
-   with the image already in place is not blocked;
+   with the image already in place is not blocked. The identity is the API group, not the version, so a record with a
+   removed apiVersion (`batch/v1beta1`) is listed like any other; the new TOE deletes its object through a served version;
+   also **before anything is changed**, asks the apiserver what the new TOE does on its first start with the remaining
+   items: `kubectl diff --server-side --field-manager=toe --force-conflicts` per item of `spec.config.items`, a server-side
+   dry run that writes nothing (needs `diff` on the device). The old TOE stopped at its first error, did not recreate
+   objects deleted by hand and skipped changes, so the new TOE's first pass can install charts that never ran, upgrade
+   them and roll Deployments. The play lists what it would **create**, what it would **change**, the items the apiserver
+   refuses as server-side apply (an unknown field or a duplicate list key: the TOE applies them with create/merge patch and
+   drops what the apiserver does not know, with a Warning Event `ApplyFallback`) and the items that fail outright. Secret
+   values are never printed. The run is refused unless `-e toe_allow_changes=true`; a re-run with the image already in place
+   is not blocked;
 3. `k3s crictl pull` the image and checks that the cached image carries the requested digest. An unpullable image never
    reaches the manifest: the watchdog reboots a device whose TOE is not Ready, so it would become a reboot loop;
 4. copies the manifest to `/var/lib/rancher/k3s/server/toe-image-backups/teknoir.yaml.bak-<UTC time>`, outside the
@@ -173,7 +183,7 @@ device: `--limit all`, wildcards and patterns that match several devices are ref
 8. prints the TOE pod, its image, `imageID` and restarts.
 
 A second run with the same image changes nothing (no new backup). Variables: `toe_image`, `toe_rollback`, `toe_backup`,
-`toe_wait_timeout`, `toe_allow_prune`, `toe_allow_many`; the paths and commands (`toe_manifest`, `toe_backup_dir`, `toe_kubectl_cmd`, `toe_crictl_cmd`,
+`toe_wait_timeout`, `toe_allow_prune`, `toe_allow_changes`, `toe_allow_many`; the paths and commands (`toe_manifest`, `toe_backup_dir`, `toe_kubectl_cmd`, `toe_crictl_cmd`,
 `toe_use_become`) default to a Teknoir device.
 
 Order: a VM device first, then a virtual device, then real devices one by one (check TOE Ready, 0 restarts, the device
@@ -186,7 +196,9 @@ tests/toe-image/run.sh
 ```
 It covers validation, the `--limit` guard (all, wildcard, union, two devices), the digest mismatch message,
 `--check --diff`, an unpullable image, the prune pre-flight (refused, `--check`, `toe_allow_prune`, namespace
-normalization, a fresh device), a successful rollout, idempotence, a failing rollout that is restored, and rollback.
+normalization, a fresh device), the create/change pre-flight (creates, changes, items refused as server-side apply,
+errors, a namespace created by the same config, `toe_allow_changes`, items sent as the TOE applies them, no secret
+values printed), a successful rollout, idempotence, a failing rollout that is restored, and rollback.
 
 ## Node roles
 A node role is a set of k3s node labels (and optional taints), so workloads can be assigned to the nodes that fill

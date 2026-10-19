@@ -14,6 +14,13 @@
 #     toe-config (status.last_applied_config) that the config (spec.config.items) no longer has. The old TOE
 #     returned on its first create error before pruning, so such items can still be running on the device (a
 #     HelmChart would be uninstalled). The run is refused unless -e toe_allow_prune=true,
+#   - also before anything is changed, asks the apiserver what the new TOE would create or change on its first
+#     start (`kubectl diff --server-side --field-manager=toe --force-conflicts` per config item: a server-side
+#     dry run, nothing is written) and which items the apiserver refuses as a server-side apply (an unknown
+#     field or a duplicate list key; the new TOE then applies them with create/merge patch and drops what the
+#     apiserver does not know). The old TOE stopped at its first error, did not recreate objects removed by
+#     hand and skipped changes, so the new TOE's first pass can install and upgrade charts and roll Deployments.
+#     The run is refused unless -e toe_allow_changes=true,
 #   - waits for the Deployment to carry the new image and `rollout status` (<= 5 min),
 #   - on failure restores the backup and waits for the old TOE to be Ready again, then fails the run,
 #   - prints the image, the imageID and the restarts of the TOE pod.
@@ -34,6 +41,8 @@
 #   toe_backup         with toe_rollback: the backup file to restore (default: the newest in toe_backup_dir).
 #   toe_wait_timeout   rollout wait in seconds, default 300.
 #   toe_allow_prune    default false. Accept that the new TOE deletes the items listed by the pre-flight check.
+#   toe_allow_changes  default false. Accept that the new TOE creates or changes the items listed by the pre-flight check
+#                      (or applies them with create/merge patch, or fails on them).
 #   toe_allow_many     default false. Allow --limit all / a wildcard / a pattern that matches more than one device.
 #   toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_crictl_cmd, toe_use_become:
 #                      where things are; the defaults fit a Teknoir device. They exist so the playbook can be tried
@@ -55,6 +64,7 @@
     toe_backup: ""
     toe_wait_timeout: 300
     toe_allow_prune: false
+    toe_allow_changes: false
     toe_allow_many: false
     toe_cr: toes.teknoir.org
     toe_cr_name: toe-config
@@ -161,13 +171,19 @@
             - "'not found' not in toe_cr_out.stderr"
             - "'doesn\\'t have a resource type' not in toe_cr_out.stderr"
 
-        - name: Items the new TOE would delete on its first start
+        - name: Cluster-scoped kinds as group/Kind
           ansible.builtin.set_fact:
-            toe_prune_keys: >-
+            toe_cluster_kinds: >-
               {%- set cluster = [] -%}
               {%- for av, k in toe_cluster_scoped.stdout | regex_findall('(\S+)\s+false\s+(\S+)[ \t]*$', multiline=True) -%}
               {%- set _ = cluster.append((av.split('/')[0] if '/' in av else '') ~ '/' ~ k) -%}
               {%- endfor -%}
+              {{ cluster | to_json }}
+
+        - name: Items the new TOE would delete on its first start
+          ansible.builtin.set_fact:
+            toe_prune_keys: >-
+              {%- set cluster = toe_cluster_kinds | from_json -%}
               {%- macro keys(items) -%}
               {%- set out = [] -%}
               {%- for it in items -%}
@@ -199,6 +215,101 @@
               so they may still run here; a HelmChart would be uninstalled. Nothing was changed. Check them
               (kubectl get toes.teknoir.org toe-config -o yaml), fix the device config, or pass -e toe_allow_prune=true
               to accept the deletes.
+            quiet: true
+
+        # What the new TOE does to the live objects on its first start. It re-applies every item (server-side
+        # apply, field manager toe, forced). The old TOE stopped at its first create error, never recreated
+        # objects deleted by hand while the record matched, skipped changes and ignored patch errors; so on a
+        # device that ran the old TOE the first start can create objects (helm installs of charts that never
+        # ran or were removed on purpose), change them (helm upgrades, Deployment rollouts) and find items the
+        # apiserver refuses as a server-side apply (an unknown field, a duplicate list key: the TOE then falls
+        # back to create/merge patch). `kubectl diff --server-side` asks the apiserver for exactly that
+        # (a server-side dry run); nothing is written. Exit code 0 = no difference, 1 = difference, 2 = error.
+        - name: The config items, as the new TOE applies them (no status, namespace like the TOE)
+          ansible.builtin.set_fact:
+            toe_spec_items: >-
+              {%- set cluster = toe_cluster_kinds | from_json -%}
+              {%- set cr = (toe_cr_out.stdout | default('{}', true) | from_json) -%}
+              {%- set out = [] -%}
+              {%- for it in ((cr.spec | default({})).config | default({})).get('items') or [] -%}
+              {%- set av = it.apiVersion | default('') -%}
+              {%- set g = av.split('/')[0] if '/' in av else '' -%}
+              {%- set md = it.metadata | default({}) -%}
+              {%- set base = it | dict2items | rejectattr('key', 'eq', 'status') | list | items2dict -%}
+              {%- set md1 = md | dict2items | rejectattr('key', 'eq', 'namespace') | list | items2dict -%}
+              {%- set md2 = md1 if (g ~ '/' ~ it.kind) in cluster else (md1 | combine({'namespace': md.namespace | default('', true) or 'default'})) -%}
+              {%- set _ = out.append(base | combine({'metadata': md2})) -%}
+              {%- endfor -%}
+              {{ out | to_json }}
+
+        - name: Server-side dry run of every config item (nothing is written)
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + ['diff', '--server-side', '--field-manager=toe', '--force-conflicts', '-f', '-'] }}"
+            stdin: "{{ toe_item | to_json }}"
+          loop: "{{ toe_spec_items | from_json }}"
+          loop_control:
+            loop_var: toe_item
+            label: "{{ toe_item.kind }} {{ toe_item.metadata.namespace | default('') }}/{{ toe_item.metadata.name | default('') }}"
+          register: toe_diff
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true  # the items can be Secrets
+
+        - name: Classify the items, creates, changes, items the apiserver refuses as server-side apply, errors
+          ansible.builtin.set_fact:
+            toe_plan: >-
+              {%- set out = {'create': [], 'change': [], 'fallback': [], 'error': []} -%}
+              {%- set made = [] -%}
+              {%- for r in toe_diff.results -%}
+              {%- if r.rc | default(2) == 1 and '@@ -0,0 ' in r.stdout | default('') and r.toe_item.kind == 'Namespace' -%}
+              {%- set _ = made.append(r.toe_item.metadata.name) -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {%- for r in toe_diff.results -%}
+              {%- set md = r.toe_item.metadata -%}
+              {%- set label = r.toe_item.kind ~ ' ' ~ ((md.namespace ~ '/') if md.namespace is defined else '') ~ md.name -%}
+              {%- set err = r.stderr | default(r.msg | default('')) -%}
+              {%- set ns_missing = err | regex_findall('namespaces "([^"]+)" not found') -%}
+              {%- set rc = r.rc | default(2) -%}
+              {%- if rc == 0 -%}
+              {%- elif rc == 1 -%}
+              {%- set _ = (out.create if '@@ -0,0 ' in r.stdout | default('') else out.change).append(label) -%}
+              {%- elif 'failed to create typed patch object' in err -%}
+              {%- set _ = out.fallback.append(label) -%}
+              {%- elif ns_missing | length > 0 and ns_missing[0] in made -%}
+              {%- set _ = out.create.append(label) -%}
+              {%- else -%}
+              {%- set _ = out.error.append(label ~ ' (' ~ ((err | trim).split('\n')[0])[:200] ~ ')') -%}
+              {%- endif -%}
+              {%- endfor -%}
+              {{ out | to_json }}
+
+        - name: Pre-flight, what the new TOE does to the live objects on its first start
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ (toe_plan | from_json).create | length }} create, {{ (toe_plan | from_json).change | length }} change,
+              {{ (toe_plan | from_json).fallback | length }} refused as server-side apply (applied with create/merge patch, unknown fields dropped),
+              {{ (toe_plan | from_json).error | length }} error(s)
+              {%- for k in ['create', 'change', 'fallback', 'error'] -%}
+              {%- if (toe_plan | from_json)[k] | length > 0 %}; {{ k }}: {{ (toe_plan | from_json)[k] | join(', ') }}{% endif -%}
+              {%- endfor %}
+
+        - name: Refuse to roll while the new TOE would create or change things (unless -e toe_allow_changes=true)
+          ansible.builtin.assert:
+            that: >-
+              toe_allow_changes | bool or
+              ((toe_plan | from_json).create + (toe_plan | from_json).change + (toe_plan | from_json).fallback + (toe_plan | from_json).error) | length == 0 or
+              (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent')
+            fail_msg: >-
+              {{ inventory_hostname }}: on its first start the new TOE re-applies every config item, and it would
+              create {{ (toe_plan | from_json).create | join(', ') | default('-', true) }};
+              change {{ (toe_plan | from_json).change | join(', ') | default('-', true) }};
+              apply the old way (the apiserver refuses these as server-side apply) {{ (toe_plan | from_json).fallback | join(', ') | default('-', true) }};
+              fail on {{ (toe_plan | from_json).error | join(', ') | default('-', true) }}.
+              Helm installs and upgrades and Deployment rollouts happen at once, the old TOE never did all of this.
+              Nothing was changed. Look at the device first (kubectl diff --server-side --field-manager=toe --force-conflicts -f <item>),
+              or pass -e toe_allow_changes=true to accept.
             quiet: true
 
         - name: Pre-pull the image into containerd (never reaches the manifest unless it pulls)

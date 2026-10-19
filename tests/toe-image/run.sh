@@ -32,6 +32,18 @@ case "$*" in
     'namespaces                        ns           v1                                     false        Namespace' \
     'nodes                             no           v1                                     false        Node' \
     'clusterroles                                   rbac.authorization.k8s.io/v1           false        ClusterRole';;
+  *"diff --server-side"*)
+    # `kubectl diff --server-side` of one item on stdin; the name prefix picks the answer. Exit 0 no difference,
+    # 1 difference ("@@ -0,0" = the object does not exist), 2 error.
+    in=$(cat); printf '%s\n' "$in" >> "$TOE_DIFF_LOG"
+    case "$in" in
+      *'"name": "new-'*) printf '%s\n' '--- LIVE' '+++ MERGED' '@@ -0,0 +1,3 @@' '+apiVersion: v1'; exit 1;;
+      *'"name": "chg-'*) printf '%s\n' '--- LIVE' '+++ MERGED' '@@ -1,3 +1,3 @@' '-a: "1"' '+a: "2"'; exit 1;;
+      *'"name": "fb-'*) echo 'Error from server: failed to create typed patch object (default/fb; apps/v1, Kind=Deployment): .spec.bogus: field not declared in schema' >&2; exit 2;;
+      *'"name": "err-'*) echo 'Error from server (Invalid): Deployment.apps "err" is invalid: spec.selector: field is immutable' >&2; exit 2;;
+      *'"name": "dep-'*) echo 'Error from server (NotFound): namespaces "new-ns" not found' >&2; exit 2;;
+    esac
+    exit 0;;
   *"get toes.teknoir.org"*) if [ -f "$TOE_CR" ]; then cat "$TOE_CR"; else echo 'Error from server (NotFound): toes.teknoir.org "toe-config" not found' >&2; exit 1; fi;;
   *"get deploy"*) printf '%s' "$img";;
   *"rollout status"*) case "$img" in *badroll*) echo "timed out" >&2; exit 1;; esac; echo "deployment successfully rolled out";;
@@ -64,7 +76,7 @@ spec:
         image: other:1
         imagePullPolicy: Always
 EOT
-export TOE_MANIFEST="$M" TOE_CR="$work/toe-config.json"
+export TOE_MANIFEST="$M" TOE_CR="$work/toe-config.json" TOE_DIFF_LOG="$work/diff.log"
 run() { ( cd "$repo" && ansible-playbook -i localhost, -c local --limit localhost playbooks/toe-image.yml \
   -e toe_use_become=false -e toe_manifest="$M" -e toe_backup_dir="$B" -e toe_wait_timeout=10 \
   -e "{\"toe_kubectl_cmd\":[\"$work/bin/kubectl\"],\"toe_crictl_cmd\":[\"$work/bin/crictl\"]}" "$@" ) 2>&1 | cat; }
@@ -154,6 +166,46 @@ o=$(run -e toe_image="$GOOD2"); ok "no status yet (fresh device): nothing stale,
 rm -f "$TOE_CR"
 sleep 1
 o=$(run -e toe_rollback=true -e toe_backup="$first"); ok "back to the original manifest (end of pre-flight tests)" "[ \"\$(img)\" = \"$OLD\" ]"
+
+# ---- pre-flight: what the new TOE would create or change (server-side dry run per config item)
+specs() { printf '{"spec":{"config":{"items":[%s]}},"status":{"last_applied_config":{"items":[]}}}\n' "$1" > "$TOE_CR"; }
+CM='{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"%s"%s},"data":{"a":"1"}}'
+cmi() { printf "$CM" "$1" "${2:+,\"namespace\":\"$2\"}"; }
+cp "$M" "$work/before"; n=$(ls "$B" | wc -l)
+specs "$(cmi same default)"
+: > "$TOE_DIFF_LOG"
+o=$(run -e toe_image="$GOOD2"); ok "no difference: rolls without the flag" "echo \"\$o\" | grep -q 'failed=0' && echo \"\$o\" | grep -q '0 create, 0 change, 0 refused as server-side apply' && [ \"\$(img)\" = \"$GOOD2\" ]"
+sleep 1
+o=$(run -e toe_rollback=true -e toe_backup="$first"); ok "back to the original manifest (changes pre-flight)" "[ \"\$(img)\" = \"$OLD\" ]"
+cp "$M" "$work/before"; n=$(ls "$B" | wc -l)
+specs "$(cmi new-cm default),$(cmi chg-cm kube-system)"
+o=$(run -e toe_image="$GOOD2"); ok "creates and changes: refused, listed, nothing changed" "echo \"\$o\" | grep -q 'create ConfigMap default/new-cm' && echo \"\$o\" | grep -q 'change ConfigMap kube-system/chg-cm' && echo \"\$o\" | grep -q '1 create, 1 change' && echo \"\$o\" | grep -q 'Nothing was changed' && cmp -s $M $work/before && [ \$(ls $B | wc -l) = $n ]"
+o=$(run --check --diff -e toe_image="$GOOD2"); ok "creates and changes: --check shows the same refusal" "echo \"\$o\" | grep -q 'create ConfigMap default/new-cm' && cmp -s $M $work/before"
+specs "$(cmi fb-cm default)"
+o=$(run -e toe_image="$GOOD2"); ok "item refused as server-side apply: refused, listed as applied the old way" "echo \"\$o\" | grep -q 'ConfigMap default/fb-cm' && echo \"\$o\" | grep -q '1 refused as server-side apply' && cmp -s $M $work/before"
+specs "$(cmi err-cm default)"
+o=$(run -e toe_image="$GOOD2"); ok "item the apiserver fails on: refused with the first line of the error" "echo \"\$o\" | grep -q 'error(s)' && echo \"\$o\" | grep -q 'field is immutable' && cmp -s $M $work/before"
+# an item in a namespace that another new item creates is a create, not an error
+specs "{\"apiVersion\":\"v1\",\"kind\":\"Namespace\",\"metadata\":{\"name\":\"new-ns\"}},$(cmi dep-cm new-ns)"
+o=$(run -e toe_image="$GOOD2"); ok "item in a namespace created by this config: create, not error" "echo \"\$o\" | grep -q '2 create, 0 change, 0 refused' && echo \"\$o\" | grep -q ' 0 error(s)' && cmp -s $M $work/before"
+sleep 1
+o=$(run -e toe_image="$GOOD2" -e toe_allow_changes=true); ok "toe_allow_changes=true rolls" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD2\" ]"
+o=$(run -e toe_image="$GOOD2"); ok "changes pending, image already in place: no flag needed (a no-op re-run)" "echo \"\$o\" | grep -q 'failed=0' && echo \"\$o\" | grep -q 'changed=0'"
+sleep 1
+o=$(run -e toe_rollback=true -e toe_backup="$first"); ok "back to the original manifest (changes pre-flight 2)" "[ \"\$(img)\" = \"$OLD\" ]"
+# items are sent as the TOE applies them: namespace default for namespaced kinds, none for cluster-scoped, no status, secrets not echoed
+cat > "$TOE_CR" <<'J'
+{"spec":{"config":{"items":[
+  {"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"nons"},"status":{"x":1}},
+  {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRole","metadata":{"name":"cr","namespace":"default"}},
+  {"apiVersion":"v1","kind":"Secret","metadata":{"name":"new-secret","namespace":"default"},"stringData":{"pw":"SECRETVALUE"}}]}}}
+J
+: > "$TOE_DIFF_LOG"
+o=$(run -e toe_image="$GOOD2"); ok "secret value is not printed" "! echo \"\$o\" | grep -q SECRETVALUE"
+ok "namespaced item without a namespace is sent to default" "grep '\"name\": \"nons\"' $TOE_DIFF_LOG | grep -q '\"namespace\": \"default\"'"
+ok "status is not sent" "! grep -q '\"status\"' $TOE_DIFF_LOG"
+ok "cluster-scoped item is sent without a namespace" "! grep '\"name\": \"cr\"' $TOE_DIFF_LOG | grep -q namespace"
+rm -f "$TOE_CR"
 
 printf 'foo: bar\n' > "$work/manifests/teknoir.yaml"
 o=$(run -e toe_image="$GOOD"); ok "manifest without the toe container is refused" "echo \"\$o\" | grep -q 'found 0'"
