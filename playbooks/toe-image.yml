@@ -10,6 +10,10 @@
 #   - copies the manifest to a backup OUTSIDE the manifests directory (k3s would apply a backup inside it),
 #   - replaces only the `image:` line of the toe container (the one after `command: - /manager`) and sets
 #     `imagePullPolicy: IfNotPresent` on it (the pinned image stays in the containerd cache),
+#   - before anything is changed, lists what the new TOE would delete on its first start: items recorded in
+#     toe-config (status.last_applied_config) that the config (spec.config.items) no longer has. The old TOE
+#     returned on its first create error before pruning, so such items can still be running on the device (a
+#     HelmChart would be uninstalled). The run is refused unless -e toe_allow_prune=true,
 #   - waits for the Deployment to carry the new image and `rollout status` (<= 5 min),
 #   - on failure restores the backup and waits for the old TOE to be Ready again, then fails the run,
 #   - prints the image, the imageID and the restarts of the TOE pod.
@@ -29,12 +33,15 @@
 #   toe_rollback       default false. true restores a backup instead (toe_image is not needed).
 #   toe_backup         with toe_rollback: the backup file to restore (default: the newest in toe_backup_dir).
 #   toe_wait_timeout   rollout wait in seconds, default 300.
+#   toe_allow_prune    default false. Accept that the new TOE deletes the items listed by the pre-flight check.
+#   toe_allow_many     default false. Allow --limit all / a wildcard / a pattern that matches more than one device.
 #   toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_crictl_cmd, toe_use_become:
 #                      where things are; the defaults fit a Teknoir device. They exist so the playbook can be tried
 #                      against a throwaway target (README).
 #
 # Backups: <toe_backup_dir>/teknoir.yaml.bak-<UTC timestamp> (default /var/lib/rancher/k3s/server/toe-image-backups).
-# Never run against a device without --limit; the run is serial 1 and stops at the first failure
+# Never run against a device without --limit, and --limit must name exactly one device (all, wildcards and groups
+# are refused unless -e toe_allow_many=true); the run is serial 1 and stops at the first failure
 # (max_fail_percentage 0). Roll out VM first, then one device, then the rest. Production only with Anders' OK.
 
 - name: Roll the TOE image of a device (digest-pinned, with backup and rollback)
@@ -47,6 +54,10 @@
     toe_rollback: false
     toe_backup: ""
     toe_wait_timeout: 300
+    toe_allow_prune: false
+    toe_allow_many: false
+    toe_cr: toes.teknoir.org
+    toe_cr_name: toe-config
     toe_manifest: /var/lib/rancher/k3s/server/manifests/teknoir.yaml
     toe_backup_dir: /var/lib/rancher/k3s/server/toe-image-backups
     toe_namespace: kube-system
@@ -71,6 +82,17 @@
       ansible.builtin.assert:
         that: ansible_limit is defined
         fail_msg: "Pass --limit <device>. This playbook never runs against every device."
+        quiet: true
+
+    - name: Refuse --limit all, wildcards and patterns that match more than one device
+      ansible.builtin.assert:
+        that:
+          - toe_allow_many | bool or ansible_limit is not search('(^|[,:])\s*all\s*([,:]|$)')
+          - toe_allow_many | bool or ansible_limit is not search('[*?~!&\[]')
+          - toe_allow_many | bool or ansible_play_hosts_all | length == 1
+        fail_msg: >-
+          --limit '{{ ansible_limit }}' matches {{ ansible_play_hosts_all | length }} device(s). Name exactly one device;
+          roll out one device at a time (VM first). To roll several on purpose pass -e toe_allow_many=true.
         quiet: true
 
     - name: Validate the image reference
@@ -116,6 +138,69 @@
               {{ inventory_hostname }}: {{ toe_old_image }} ({{ toe_old_policy }}) -> {{ toe_image }} (IfNotPresent){{
               '; already in place, nothing to change' if (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent') else '' }}
 
+        # What the new TOE deletes on its first start. The new TOE prunes every recorded item that the config no
+        # longer has; the old TOE did not when an apply failed (it returned before pruning), so such items may
+        # still run on this device. Same identity as the TOE: API group, kind, namespace (none for a cluster-scoped
+        # kind, "default" when a namespaced item has none) and name.
+        - name: Which kinds are cluster-scoped on this device
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + ['api-resources', '--namespaced=false', '--no-headers'] }}"
+          register: toe_cluster_scoped
+          changed_when: false
+          check_mode: false
+
+        - name: Read the TOE config and what the TOE recorded as applied
+          ansible.builtin.command:
+            argv: "{{ toe_kubectl_cmd + ['get', toe_cr, toe_cr_name, '-o', 'json'] }}"
+          register: toe_cr_out
+          changed_when: false
+          check_mode: false
+          failed_when:
+            - toe_cr_out.rc != 0
+            - "'NotFound' not in toe_cr_out.stderr"
+            - "'not found' not in toe_cr_out.stderr"
+            - "'doesn\\'t have a resource type' not in toe_cr_out.stderr"
+
+        - name: Items the new TOE would delete on its first start
+          ansible.builtin.set_fact:
+            toe_prune_keys: >-
+              {%- set cluster = [] -%}
+              {%- for av, k in toe_cluster_scoped.stdout | regex_findall('(\S+)\s+false\s+(\S+)[ \t]*$', multiline=True) -%}
+              {%- set _ = cluster.append((av.split('/')[0] if '/' in av else '') ~ '/' ~ k) -%}
+              {%- endfor -%}
+              {%- macro keys(items) -%}
+              {%- set out = [] -%}
+              {%- for it in items -%}
+              {%- set av = it.apiVersion | default('') -%}
+              {%- set g = av.split('/')[0] if '/' in av else '' -%}
+              {%- set md = it.metadata | default({}) -%}
+              {%- set ns = '' if (g ~ '/' ~ it.kind) in cluster else (md.namespace | default('', true) or 'default') -%}
+              {%- set _ = out.append(g ~ '/' ~ it.kind ~ ' ' ~ ns ~ '/' ~ md.name | default('')) -%}
+              {%- endfor -%}
+              {{ out | to_json }}
+              {%- endmacro -%}
+              {%- set cr = (toe_cr_out.stdout | default('{}', true) | from_json) -%}
+              {%- set spec = keys(((cr.spec | default({})).config | default({})).get('items') or []) | from_json -%}
+              {%- set rec = keys(((cr.status | default({})).last_applied_config | default({})).get('items') or []) | from_json -%}
+              {{ rec | difference(spec) | unique | list | to_json }}
+
+        - name: Pre-flight, items recorded as applied and no longer in the config
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ toe_prune_keys | from_json | length }} item(s) the new TOE would delete on its first start{{
+              ': ' ~ (toe_prune_keys | from_json | join(', ')) if toe_prune_keys | from_json | length > 0 else '' }}
+
+        - name: Refuse to roll while the new TOE would delete items (unless -e toe_allow_prune=true)
+          ansible.builtin.assert:
+            that: toe_allow_prune | bool or (toe_prune_keys | from_json | length) == 0 or (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent')
+            fail_msg: >-
+              {{ inventory_hostname }}: the new TOE would delete {{ toe_prune_keys | from_json | length }} item(s) on its first start:
+              {{ toe_prune_keys | from_json | join(', ') }}. The old TOE never pruned them (it stopped at its first create error),
+              so they may still run here; a HelmChart would be uninstalled. Nothing was changed. Check them
+              (kubectl get toes.teknoir.org toe-config -o yaml), fix the device config, or pass -e toe_allow_prune=true
+              to accept the deletes.
+            quiet: true
+
         - name: Pre-pull the image into containerd (never reaches the manifest unless it pulls)
           ansible.builtin.command:
             argv: "{{ toe_crictl_cmd + ['pull', toe_image] }}"
@@ -134,14 +219,14 @@
         - name: The image in the cache carries the requested digest
           ansible.builtin.assert:
             that: toe_digest in toe_have
-          vars:
-            toe_digest: "{{ toe_image | regex_replace('^.*@', '') }}"
-            toe_have: "{{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) | map('regex_replace', '^.*@', '') | list }}"
             fail_msg: >-
               The image in the containerd cache of {{ inventory_hostname }} does not carry the digest
               {{ toe_image | regex_replace('^.*@', '') }} (repoDigests: {{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) }}).
               The manifest was not changed.
             quiet: true
+          vars:
+            toe_digest: "{{ toe_image | regex_replace('^.*@', '') }}"
+            toe_have: "{{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) | map('regex_replace', '^.*@', '') | list }}"
           when: not ansible_check_mode or toe_inspect.rc == 0
 
         - name: Make the backup directory (outside the manifests directory, so k3s does not apply backups)
