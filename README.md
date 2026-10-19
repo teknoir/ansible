@@ -295,6 +295,9 @@ teamspace as every other tnctl command, WireGuard where it is active, passwordle
 - `ansible.cfg` no longer names an inventory. If `~/.ansible.cfg` still has `inventory = ~/.ansible/inventory.py`,
   remove that line (tnctl passes its own `-i`, so it is not used by `tnctl ansible`, but plain `ansible` would still
   use it).
+- A platform with the fleet API (backstage PR #400) no longer puts device logins (`rsa_private`, `userpassword`)
+  into the catalog, which `inventory.py` reads. On such a platform `inventory.py` stops with an error that names
+  the devices and points to `tnctl ansible-inventory`; it does not return an empty inventory. Use tnctl.
 - `inventory_system.py` and `ansible_system.cfg` (`TEKNOIR_ANSIBLE_INSTALL=system`) stay for the JupyterLab notebook
   image until that image ships tnctl.
 

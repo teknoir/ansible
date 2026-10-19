@@ -169,6 +169,7 @@ class TeknoirInventory(object):
             }
         }
 
+        missing_login = []
         for device in devices:
             metadata = device.get('metadata', {})
             spec = device.get('spec', {})
@@ -224,6 +225,9 @@ class TeknoirInventory(object):
                 continue
 
             if not (username_b64 and userpassword_b64):
+                # A platform that keeps device logins out of the catalog (fleet API) leaves these out.
+                # Skipping the device silently would hand Ansible an empty inventory.
+                missing_login.append(name)
                 continue
 
             deadendhost = f'deadend-{namespace}.{self.domain}'
@@ -253,6 +257,15 @@ class TeknoirInventory(object):
                 'ansible_teknoir_device': name,
                 'ansible_teknoir_domain': self.domain,
             }
+        if missing_login:
+            shown = ', '.join(missing_login[:10]) + (', ...' if len(missing_login) > 10 else '')
+            sys.exit(
+                f"ERROR: {len(missing_login)} device(s) with an open tunnel have no login in the catalog ({shown}). "
+                "A platform with the fleet API no longer puts device logins (private key, password) into the "
+                "catalog, which this deprecated inventory reads. Use tnctl as the inventory: "
+                "`tnctl ansible-inventory --list` or `tnctl ansible-playbook` "
+                "(https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md)."
+            )
         return inventory
 
     # Empty inventory for testing.
