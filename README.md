@@ -132,6 +132,53 @@ that k3s is active, the TOE deployment is Ready, and that the platform user has 
 holds no password for it.
 `--limit` is required. Test on a VM or virtual device first.
 
+## TOE image rollout
+`playbooks/toe-image.yml` switches the TOE (the on-device agent, Deployment `kube-system/toe`) to an immutable,
+digest-pinned image, and rolls back. The Deployment lives in `/var/lib/rancher/k3s/server/manifests/teknoir.yaml`, which
+k3s re-applies when the file changes, so `kubectl set image` is reverted and the config channel cannot change it; the
+playbook edits that file. It is the lighter alternative to `rebootstrap-device.yml`, which would reset the line to
+`docker.io/tekn0ir/toe:toe_v4`.
+
+```bash
+# Roll out (one device at a time; --limit is required, -e toe_image must carry a digest)
+tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 \
+  -e toe_image=ghcr.io/teknoir/toe-app:sha-1a2b3c4d@sha256:<64 hex digits>
+
+# Only look: prints the plan and the diff of the manifest; no pull, no backup, no restart
+tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 --check --diff -e toe_image=...
+
+# Roll back: restore the newest backup (or -e toe_backup=<file>) and wait for the TOE to be Ready
+tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 -e toe_rollback=true
+```
+
+Per device (`serial: 1`, `max_fail_percentage: 0`: the run stops at the first failure):
+1. validates `toe_image` (`<registry>/<repo>[:<tag>]@sha256:<digest>`; a reference without a digest is refused) and that
+   the manifest holds exactly one toe container (the one after `command: - /manager`);
+2. `k3s crictl pull` the image and checks that the cached image carries the requested digest. An unpullable image never
+   reaches the manifest: the watchdog reboots a device whose TOE is not Ready, so it would become a reboot loop;
+3. copies the manifest to `/var/lib/rancher/k3s/server/toe-image-backups/teknoir.yaml.bak-<UTC time>`, outside the
+   manifests directory so that k3s does not apply backups;
+4. replaces only the toe container's `image:` and sets `imagePullPolicy: IfNotPresent` (the pinned image stays cached,
+   so a registry outage does not stop a TOE restart);
+5. waits until the Deployment carries the new image and `rollout status` is done (`toe_wait_timeout`, default 300 s);
+6. on any failure: restores the backup, waits for the old TOE to be Ready, and fails the run;
+7. prints the TOE pod, its image, `imageID` and restarts.
+
+A second run with the same image changes nothing (no new backup). Variables: `toe_image`, `toe_rollback`, `toe_backup`,
+`toe_wait_timeout`; the paths and commands (`toe_manifest`, `toe_backup_dir`, `toe_kubectl_cmd`, `toe_crictl_cmd`,
+`toe_use_become`) default to a Teknoir device.
+
+Order: a VM device first, then a virtual device, then real devices one by one (check TOE Ready, 0 restarts, the device
+Online, no `ApplyFailed` events, before the next). Production devices only with the usual production OK. Never use a
+moving tag (`toe_v4`, `latest`); roll back to the old tag by restoring the backup.
+
+**Test it without a device** (fake manifest, stubbed `crictl` and `kubectl`, runs as a normal user):
+```bash
+tests/toe-image/run.sh
+```
+It covers validation, `--check --diff`, an unpullable image, a successful rollout, idempotence, a failing rollout that
+is restored, and rollback.
+
 ## Node roles
 A node role is a set of k3s node labels (and optional taints), so workloads can be assigned to the nodes that fill
 the role with a plain `nodeSelector`:
