@@ -334,6 +334,9 @@ teamspace as every other tnctl command, WireGuard where it is active, passwordle
 - A platform with the fleet API (backstage PR #400) no longer puts device logins (`rsa_private`, `userpassword`)
   into the catalog, which `inventory.py` reads. On such a platform `inventory.py` stops with an error that names
   the devices and points to `tnctl ansible-inventory`; it does not return an empty inventory. Use tnctl.
+- `inventory.py` sends Backstage only a main token: a stored token with the `teknoir-ztna` (WireGuard hub) audience is
+  replaced, and it refreshes with the granted scopes minus `teknoir-ztna`. It refuses a refreshed token that still has
+  the audience. Tests: `python3 -m unittest discover -s tests -p 'test_inventory*.py'`.
 - `inventory_system.py` and `ansible_system.cfg` (`TEKNOIR_ANSIBLE_INSTALL=system`) stay for the JupyterLab notebook
   image until that image ships tnctl.
 
