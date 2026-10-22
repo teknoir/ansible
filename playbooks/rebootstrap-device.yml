@@ -19,10 +19,19 @@
 #      device's k3s CA, and the script would replace it. Adopt the device instead
 #      (playbooks/adopt-device.yml). -e rebootstrap_allow_missing_cert=true accepts a device
 #      without the certificate.
-#   4. The script runs on the device as root (CREATE_USER=true, no prompts) and is removed. Its log
+#   4. Keeps custom k3s networks (playbooks/files/tn-k3s-networks.sh, before the script runs). The
+#      script reinstalls k3s and rewrites its systemd unit, which loses --cluster-cidr,
+#      --service-cidr and --cluster-dns given only on the install command line (virtual devices
+#      use 10.52.0.0/16, 10.53.0.0/16 and 10.53.0.10; without them k3s crash-loops on the podCIDR
+#      of the existing node). Those flags, and the same keys in config.yaml, are copied to
+#      /etc/rancher/k3s/config.yaml.d/10-k3s-networks.yaml, which a reinstall keeps. Only those
+#      three keys are read, never the rest of the k3s config (it holds the token). The run stops
+#      if the networks cannot be determined but the node's podCIDR is outside 10.42.0.0/16.
+#      Default networks: nothing is written.
+#   5. The script runs on the device as root (CREATE_USER=true, no prompts) and is removed. Its log
 #      is kept in /var/log/teknoir-rebootstrap.log (root only; the script never prints a secret).
-#   5. Removes duplicate members of the users and sudo groups that older scripts left.
-#   6. Checks: k3s active, TOE Ready, and the platform user's sudo: passwordless when the platform
+#   6. Removes duplicate members of the users and sudo groups that older scripts left.
+#   7. Checks: k3s active, TOE Ready, and the platform user's sudo: passwordless when the platform
 #      holds no password for it (the run fails otherwise).
 #
 # Uses tnctl as the inventory (`tnctl ansible-playbook`), so the domain and teamspace come from
@@ -155,6 +164,28 @@
               {{ rebootstrap_device }}. Re-bootstrapping would replace the root of its k3s CA. Adopt
               the device instead (playbooks/adopt-device.yml), which keeps the device key.
             quiet: true
+
+        - name: Keep the custom k3s networks of the device (the reinstall rewrites the k3s unit)
+          # Reads only cluster-cidr, service-cidr and cluster-dns, and prints one status line.
+          ansible.builtin.script:
+            cmd: files/tn-k3s-networks.sh
+            executable: /bin/sh
+          become: true
+          check_mode: false
+          environment:
+            TN_DRY_RUN: "{{ '1' if ansible_check_mode else '0' }}"
+          register: tn_networks
+          changed_when: "'tn-k3s-networks: changed' in tn_networks.stdout"
+          failed_when: false
+
+        - name: The k3s networks of the device are kept
+          ansible.builtin.assert:
+            that: tn_networks.rc == 0
+            fail_msg: >-
+              Not running the bootstrap script on {{ rebootstrap_device }}, it would break k3s:
+              {{ (tn_networks.stderr | default('', true) ~ tn_networks.msg | default('', true)) | trim }}
+            success_msg: "{{ tn_networks.stdout | trim }}"
+            quiet: false
 
         - name: Run the bootstrap script
           block:

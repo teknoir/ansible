@@ -125,7 +125,12 @@ Per device (serial 1, the rollout stops at the first failure): renders the scrip
 temp dir that is always removed (the script holds the device keys); refuses to continue when the device
 certificate in the platform differs from `/etc/teknoir/rsa_public.pem`, or the device has none (it is the root of the
 device's k3s CA; adopt the device with `playbooks/adopt-device.yml` instead, or pass
-`-e rebootstrap_allow_missing_cert=true`); copies the script root-only, runs it in the background
+`-e rebootstrap_allow_missing_cert=true`); keeps custom k3s networks (the script rewrites the k3s unit, which would
+drop `--cluster-cidr`, `--service-cidr` and `--cluster-dns` given only on the install command line, as virtual devices
+have: k3s then crash-loops on the podCIDR of the node): `files/tn-k3s-networks.sh` reads only those three keys from
+the unit and `config.yaml[.d]` and writes them to `/etc/rancher/k3s/config.yaml.d/10-k3s-networks.yaml` unless a
+drop-in already holds them, and the run stops if they cannot be determined while the node's podCIDR is outside
+10.42.0.0/16 (test: `tests/k3s-networks/run.sh`); copies the script root-only, runs it in the background
 (polled; a k3s restart may drop the connection for a while) with its output in `/var/log/teknoir-rebootstrap.log`,
 and removes it; removes duplicate members of the `users` and `sudo` groups that older scripts left; then checks
 that k3s is active, the TOE deployment is Ready, and that the platform user has passwordless sudo when the platform
