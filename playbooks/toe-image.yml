@@ -411,6 +411,11 @@
         - name: Check that the TOE pod can be pinned to the server node after the restore (shared with rebootstrap-device.yml)
           ansible.builtin.import_tasks: tasks/toe-pin-check.yml
 
+        # Back to the manifest: a later import of tasks/toe-manifest-read.yml must not read the backup silently.
+        - name: Read the manifest again from here on
+          ansible.builtin.set_fact:
+            toe_read_src: "{{ toe_manifest }}"
+
         - name: Plan
           ansible.builtin.debug:
             msg: >-
