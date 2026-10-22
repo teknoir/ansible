@@ -1,0 +1,56 @@
+---
+# Test harness for tests/toe-keep/run.sh: the TOE-image keeping steps of playbooks/rebootstrap-device.yml
+# (the real task files, in the same block/always shape), with the bootstrap script replaced by a stand-in.
+#   fake_script  keep    leave the manifest
+#                rewrite write the template's image (moving tag toe_v4, imagePullPolicy Always)
+#                delete  remove the manifest
+#                double  a second toe container
+#   fake_fail    true: the "script" fails after it ran (k3s-active check, group cleanup, ...)
+- name: Keep the TOE image across a fake re-bootstrap
+  hosts: all
+  gather_facts: false
+  vars:
+    rebootstrap_device: test-device
+    toe_wait_timeout: 10
+    fake_script: keep
+    fake_fail: false
+  vars_files:
+    - ../../playbooks/vars/toe-manifest.yml
+  tasks:
+    - name: Re-bootstrap
+      block:
+        - name: Remember
+          ansible.builtin.import_tasks: ../../playbooks/tasks/toe-keep-remember.yml
+
+        - name: The stand-in for the bootstrap script, rewrite
+          ansible.builtin.replace:
+            path: "{{ toe_manifest }}"
+            regexp: '(command:\n[ ]+- /manager\n[ ]+image: )\S+(\n[ ]+imagePullPolicy: )\S+'
+            replace: '\g<1>docker.io/tekn0ir/toe:toe_v4\g<2>Always'
+          diff: false  # the stand-in is not what is tested; the real tasks must pass with --diff
+          when: fake_script == 'rewrite'
+
+        - name: The stand-in for the bootstrap script, delete
+          ansible.builtin.file:
+            path: "{{ toe_manifest }}"
+            state: absent
+          when: fake_script == 'delete'
+
+        - name: The stand-in for the bootstrap script, double
+          ansible.builtin.shell:
+            cmd: |
+              printf '%s\n' '---' 'kind: Deployment' 'spec:' '  template:' '    spec:' '      containers:' \
+                '      - command:' '        - /manager' '        image: x:1' '        imagePullPolicy: Always' >> "{{ toe_manifest }}"
+          changed_when: true
+          when: fake_script == 'double'
+
+        - name: The stand-in for a failing step before the restore
+          ansible.builtin.fail:
+            msg: a step failed
+          when: fake_fail | bool
+
+        - name: Restore
+          ansible.builtin.import_tasks: ../../playbooks/tasks/toe-keep-restore.yml
+      always:
+        - name: Hint
+          ansible.builtin.import_tasks: ../../playbooks/tasks/toe-keep-hint.yml

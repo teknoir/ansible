@@ -125,7 +125,22 @@ Per device (serial 1, the rollout stops at the first failure): renders the scrip
 temp dir that is always removed (the script holds the device keys); refuses to continue when the device
 certificate in the platform differs from `/etc/teknoir/rsa_public.pem`, or the device has none (it is the root of the
 device's k3s CA; adopt the device with `playbooks/adopt-device.yml` instead, or pass
-`-e rebootstrap_allow_missing_cert=true`); copies the script root-only, runs it in the background
+`-e rebootstrap_allow_missing_cert=true`); keeps custom k3s networks (the script rewrites the k3s unit, which would
+drop `--cluster-cidr`, `--service-cidr` and `--cluster-dns` given only on the install command line, as virtual devices
+have: k3s then crash-loops on the podCIDR of the node): `files/tn-k3s-networks.sh` reads only those three keys from
+the unit and `config.yaml[.d]` and writes them to `/etc/rancher/k3s/config.yaml.d/10-k3s-networks.yaml` unless a
+drop-in already holds them, and the run stops if they cannot be determined while the node's podCIDR is outside
+10.42.0.0/16 (test: `tests/k3s-networks/run.sh`); remembers a TOE image that is pinned by digest (`@sha256:`): the
+bootstrap templates regenerate `teknoir.yaml` with the moving tag `docker.io/tekn0ir/toe:toe_v4` and
+`imagePullPolicy: Always`, which would undo a TOE rolled out with `playbooks/toe-image.yml`; after the script it puts
+the pinned image back the way `toe-image.yml` does (same shared tasks in `playbooks/tasks/`: `crictl pull` and digest
+check first, so an unpullable image never reaches the manifest; then backup outside the manifests directory, image line
+replaced, `IfNotPresent`, wait for the rollout), prints one line (`TOE image: kept <image> ...`, `nothing to keep`, or a
+WARNING when `teknoir.yaml` is not at the default path: custom k3s data-dir, pass `-e toe_manifest=<data-dir>/server/manifests/teknoir.yaml`)
+and leaves a TOE on a tag without a digest to the templates. The run fails, and prints `toe-image.yml -e toe_image=<image>`,
+when the image cannot be put back or the manifest no longer holds exactly one toe container; the same command is printed
+when the run stops earlier. The manifest holds the image pull Secrets and is never printed (`no_log`; test:
+`tests/toe-keep/run.sh`); copies the script root-only, runs it in the background
 (polled; a k3s restart may drop the connection for a while) with its output in `/var/log/teknoir-rebootstrap.log`,
 and removes it; removes duplicate members of the `users` and `sudo` groups that older scripts left; then checks
 that k3s is active, the TOE deployment is Ready, and that the platform user has passwordless sudo when the platform

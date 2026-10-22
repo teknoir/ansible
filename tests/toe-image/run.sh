@@ -51,10 +51,18 @@ case "$*" in
 esac
 S
 chmod +x "$work/bin/"*
+CANARY="CANARY-PULL-SECRET-$$-xyz"
 cat > "$M" <<EOT
 apiVersion: v1
 kind: Namespace
 metadata: {name: x}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: pull, namespace: kube-system}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: $CANARY
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -90,7 +98,7 @@ o=$(run -e toe_image="$OLD"); ok "tag without digest is refused" "echo \"\$o\" |
 o=$(run -e toe_image="ghcr.io/x/y@sha256:abc"); ok "short digest is refused" "echo \"\$o\" | grep -q 'refused'"
 cp "$M" "$work/before"
 o=$(run --check --diff -e toe_image="$GOOD"); [ -n "${SHOW:-}" ] && echo "$o"; ok "check mode changes nothing" "cmp -s $M $work/before && [ ! -d $B ]"
-ok "check mode shows the diff" "echo \"\$o\" | grep -q '^+.*image: ghcr.io/teknoir/toe-app:sha-11111111'"
+ok "check mode shows the image before and after (the plan, not a file diff)" "echo \"\$o\" | grep -qF -- '-> $GOOD (IfNotPresent)' && echo \"\$o\" | grep -qF '$OLD (Always)'"
 o=$(run -e toe_image="$NOPULL"); ok "unpullable image: run fails, manifest untouched" "! echo \"\$o\" | grep -q 'failed=0' && cmp -s $M $work/before && [ ! -d $B ]"
 o=$(run -e toe_image="$GOOD"); ok "rollout succeeds" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ] && [ \"\$(pol)\" = IfNotPresent ]"
 ok "only the toe container changed (sidecar untouched)" "grep -q 'image: other:1' $M && [ \$(grep -c 'imagePullPolicy: Always' $M) = 1 ]"
@@ -204,6 +212,14 @@ J
 o=$(run -e toe_image="$GOOD2"); ok "secret value is not printed" "! echo \"\$o\" | grep -q SECRETVALUE"
 o=$(run -vvv -e toe_image="$GOOD2"); ok "secret value is not printed with -vvv" "! echo \"\$o\" | grep -q SECRETVALUE"
 ok "the -vvv run did run the playbook" "echo \"\$o\" | grep -q 'Server-side dry run'"
+# the manifest holds Secrets (image pull secrets): slurp returns it base64-encoded, so a leak shows as the base64 of the file
+B64HEAD=$(printf 'apiVersion: v1\nkind: Namespace\nmetadata: {name: x}\n---\napiVersion: v1\nkind: Secret\n' | base64 -w0 | cut -c1-60)
+ok "the manifest Secret is not printed with -vvv (plain or base64)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+for v in "--diff -vvv" "--check --diff -vvv"; do
+  o=$(run $v -e toe_image="$GOOD"); ok "the manifest Secret is not printed with $v on a roll (plain or base64)" "echo \"\$o\" | grep -q 'PLAY RECAP' && ! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+done
+o=$(run --diff -vvv -e toe_rollback=true); ok "the manifest Secret is not printed with --diff -vvv on a rollback" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+o=$(run -vvv -e toe_rollback=true); ok "the manifest Secret is not printed with -vvv on a rollback" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
 ok "namespaced item without a namespace is sent to default" "grep '\"name\": \"nons\"' $TOE_DIFF_LOG | grep -q '\"namespace\": \"default\"'"
 ok "status is not sent" "! grep -q '\"status\"' $TOE_DIFF_LOG"
 ok "cluster-scoped item is sent without a namespace" "! grep '\"name\": \"cr\"' $TOE_DIFF_LOG | grep -q namespace"
@@ -211,4 +227,6 @@ rm -f "$TOE_CR"
 
 printf 'foo: bar\n' > "$work/manifests/teknoir.yaml"
 o=$(run -e toe_image="$GOOD"); ok "manifest without the toe container is refused" "echo \"\$o\" | grep -q 'found 0'"
+rm -f "$work/manifests/teknoir.yaml"
+o=$(run -e toe_image="$GOOD"); ok "missing manifest is refused with the path" "echo \"\$o\" | grep -q 'TOE manifest not found at $M'"
 exit $fail

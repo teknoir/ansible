@@ -1,0 +1,32 @@
+---
+# Pre-pull toe_image into containerd and check that the cache carries the requested digest, BEFORE the
+# manifest is edited: an unpullable image must never reach the manifest (the TOE Deployment uses strategy
+# Recreate, and a device whose TOE is not Ready is rebooted by its watchdog). Shared by toe-image.yml and
+# rebootstrap-device.yml. Needs toe_image and toe_crictl_cmd; the caller sets become.
+- name: Pre-pull the image into containerd (never reaches the manifest unless it pulls)
+  ansible.builtin.command:
+    argv: "{{ toe_crictl_cmd + ['pull', toe_image] }}"
+  register: toe_pull
+  changed_when: false  # a pull of a cached image is not a change; the manifest edit is
+  when: not ansible_check_mode
+
+- name: Inspect the pulled image
+  ansible.builtin.command:
+    argv: "{{ toe_crictl_cmd + ['inspecti', '-o', 'json', toe_image] }}"
+  register: toe_inspect
+  changed_when: false
+  failed_when: not ansible_check_mode and toe_inspect.rc != 0  # in check mode the image is not pulled
+  check_mode: false
+
+- name: The image in the cache carries the requested digest
+  ansible.builtin.assert:
+    that: toe_digest in toe_have
+    fail_msg: >-
+      The image in the containerd cache of {{ inventory_hostname }} does not carry the digest
+      {{ toe_image | regex_replace('^.*@', '') }} (repoDigests: {{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) }}).
+      The manifest was not changed.
+    quiet: true
+  vars:
+    toe_digest: "{{ toe_image | regex_replace('^.*@', '') }}"
+    toe_have: "{{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) | map('regex_replace', '^.*@', '') | list }}"
+  when: not ansible_check_mode or toe_inspect.rc == 0
