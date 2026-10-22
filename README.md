@@ -290,11 +290,11 @@ device (`all`, wildcards and patterns that match several are refused unless `-e 
 9. **on any failure after step 6**: restores the backup (or removes the file), restarts k3s, waits, then fails.
 
 `-e registry_rollback=true` restores the newest backup by the timestamp in its name, `bak` or `absent` alike (the file it replaces is kept as `registries.yaml.pre-rollback-<UTC>`),
-restarts k3s only if the file changes, and waits. `--check` stops after step 4. A second run changes nothing (no
+restarts k3s only if the file changes, and waits. After a second change (a re-run for a rotated credential) the newest backup is the previous Harbor file; to remove the mirror altogether add `-e registry_rollback_to=original`, which restores the oldest backup (the owner's file from before the first run, or removes the file when there was none). `--check` stops after step 4. A second run changes nothing (no
 backup, no restart). The credential is never printed: not in the plan, the diff, the task output or `-vvv`.
 
 Variables: `registry_kube_context` (required unless rolling back), `registry_host` (default
-`harbor.<ansible_teknoir_domain>`), `registry_rollback`, `registry_backup`, `registry_allow_replace`,
+`harbor.<ansible_teknoir_domain>`), `registry_rollback`, `registry_rollback_to`, `registry_backup`, `registry_allow_replace`,
 `registry_allow_many`, `registry_proof_image`, `registry_wait_timeout` (300), `registry_node_name` (default: `node-name` of
 `/etc/rancher/k3s/config.yaml`, else the host name); the paths and commands (`registry_file`, `registry_file_owner`,
 `registry_backup_dir`, `registry_hosts_toml`, `registry_config_yaml`, `registry_*_cmd`, `registry_use_become`) default to a

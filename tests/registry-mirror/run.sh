@@ -205,6 +205,24 @@ printf '# managed by teknoir\n# newer-bak\nmirrors: {}\n' > "$B/registries.yaml.
 printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
 o=$(go -e registry_rollback=true); ok "rollback: a newer bak wins over an older absent-marker" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'newer-bak' $REG"
 
+# ---- registry_rollback_to=original: the pre-mirror state, however many managed generations came after it
+reset
+mkdir -p "$B"; chmod 700 "$B"
+printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://owner-mirror.example"\n' > "$B/registries.yaml.bak-20260101T000000Z"
+printf '# managed by teknoir\n# gen1\nmirrors: {}\n' > "$B/registries.yaml.bak-20260201T000000Z"
+printf '# managed by teknoir\n# gen2\nmirrors: {}\n' > "$B/registries.yaml.bak-20260301T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true); ok "rollback (newest) with two managed generations restores the previous managed file" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'gen2' $REG"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true -e registry_rollback_to=original); ok "rollback_to=original restores the owner's file from before the first run" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'owner-mirror.example' $REG && ! grep -q 'managed by' $REG"
+reset
+mkdir -p "$B"; chmod 700 "$B"
+: > "$B/registries.yaml.absent-20260101T000000Z"
+printf '# managed by teknoir\n# gen1\nmirrors: {}\n' > "$B/registries.yaml.bak-20260201T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true -e registry_rollback_to=original); ok "rollback_to=original with no file before the first run removes the mirror file" "echo \"\$o\" | grep -q 'failed=0' && [ ! -e $REG ]"
+o=$(go -e registry_rollback=true -e registry_rollback_to=sideways); ok "an unknown registry_rollback_to is refused" "echo \"\$o\" | grep -q 'must be newest or original'"
+
 # ---- a file that is not ours
 reset
 printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://mine.example"\n' > "$REG"; cp "$REG" "$work/foreign"

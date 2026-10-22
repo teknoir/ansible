@@ -35,12 +35,18 @@
 #
 #   # Roll back: restore the newest backup (or -e registry_backup=<file>), restart k3s if the file changes, wait
 #   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_rollback=true
+#   # Remove the mirror: restore the state from before the first run (the oldest backup: the owner's file, or
+#   # "there was none" and the file is removed), however many credential rotations came since
+#   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_rollback=true -e registry_rollback_to=original
 #
 # Variables
 #   registry_kube_context  required (not with registry_rollback): the kubectl context of the platform cluster that
 #                          holds the credential Secret, for example vpro. Never defaulted.
 #   registry_host          default harbor.<ansible_teknoir_domain>
 #   registry_rollback      default false. true restores a backup instead (no credential, no probe).
+#   registry_rollback_to   with registry_rollback: newest (default: undo the last change; after a re-run for a rotated
+#                          credential this puts back the previous Harbor file) or original (the oldest backup in
+#                          registry_backup_dir: the pre-mirror state; removes the mirror).
 #   registry_backup        with registry_rollback: the backup file to restore (default: the newest in registry_backup_dir).
 #   registry_allow_replace default false. Replace a registries.yaml that this playbook did not write.
 #   registry_allow_many    default false. Allow --limit all / a wildcard / a pattern that matches more than one device.
@@ -67,6 +73,7 @@
     registry_kube_context: ""
     registry_host: "harbor.{{ ansible_teknoir_domain | default('') }}"
     registry_rollback: false
+    registry_rollback_to: newest
     registry_backup: ""
     registry_allow_replace: false
     registry_allow_many: false
@@ -236,13 +243,26 @@
             patterns: ["registries.yaml.bak-*", "registries.yaml.absent-*"]
           register: registry_baks
 
+        - name: Refuse an unknown registry_rollback_to
+          ansible.builtin.assert:
+            that: registry_rollback_to in ['newest', 'original']
+            fail_msg: "registry_rollback_to must be newest or original, not '{{ registry_rollback_to }}'. Nothing was changed."
+            quiet: true
+
         - name: Choose the backup
+          ansible.builtin.set_fact:
+            # sort by the timestamp in the name (absent-* sorts before bak-* by name, so the name alone would be wrong)
+            registry_baks_by_time: >-
+              {{ registry_baks.files | map(attribute='path')
+              | map('regex_replace', '^(.*)/registries\.yaml\.(bak|absent)-([^/]*)$', '\3 \1/registries.yaml.\2-\3')
+              | sort | list }}
+
+        - name: Pick the newest or the oldest
           ansible.builtin.set_fact:
             registry_restore_from: >-
               {{ registry_backup if registry_backup != '' else
-              (registry_baks.files | map(attribute='path')
-              | map('regex_replace', '^(.*)/registries\.yaml\.(bak|absent)-([^/]*)$', '\3 \1/registries.yaml.\2-\3')
-              | sort | list | last | default('') | regex_replace('^[^ ]* ', '')) }}
+              ((registry_baks_by_time | first if registry_rollback_to == 'original' else registry_baks_by_time | last)
+              | default('') | regex_replace('^[^ ]* ', '')) }}
 
         - name: Refuse without a backup
           ansible.builtin.assert:
