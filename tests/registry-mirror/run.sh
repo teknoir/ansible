@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# Local test of playbooks/registry-mirror.yml against a throwaway directory with stubbed `kubectl`, `curl`,
+# `crictl`, `systemctl` and `hostname`. No device, no cluster, no root, no network. Usage: tests/registry-mirror/run.sh
+#
+# The stubs behave like the real tools where it matters: the platform's Secret holds the credential under the
+# key <namespace>.username/password, Harbor's token endpoint accepts only the right credential (read from the curl
+# config on stdin), the manifest HEAD accepts only the token it issued, and a k3s restart regenerates containerd's
+# hosts.toml from registries.yaml. Every run's output is collected and searched for the stub password and token.
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+work=$(mktemp -d)
+trap '[ -n "${KEEP:-}" ] && echo "kept $work" || rm -rf "${work:?}"' EXIT
+mkdir -p "$work/bin" "$work/etc" "$work/state"
+export ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_HOST_KEY_CHECKING=False
+S="$work/state"
+# containerd's hosts.toml lives under k3s's data directory; the default data directory is a throwaway one
+# (-e registry_default_data_dir), custom ones are made per test (config.yaml, config.yaml.d, unit --data-dir)
+DD="$work/k3s" HTREL=agent/etc/containerd/certs.d/docker.io/hosts.toml
+mkdir -p "$DD/agent/etc/containerd/certs.d/docker.io"
+REG="$work/etc/registries.yaml" B="$work/backups" HT="$DD/$HTREL" CFG="$work/etc/config.yaml"
+export STUB_STATE="$S" STUB_REG="$REG" STUB_HT="$HT"
+PASS='StubRobotPassw0rdFORtest'
+PASS2='RotatedRobotPassw0rd2FORtest'
+USERNAME='robot$ts-teknoir-demo'
+TOKEN='TOKEN123StubOnly'
+export STUB_USER_B64=$(printf '%s' "$USERNAME" | base64 -w0) STUB_PASS_B64=$(printf '%s' "$PASS" | base64 -w0) STUB_PASS="$PASS" STUB_TOKEN="$TOKEN"
+ALL="$work/all-output.log"; : > "$ALL"
+
+cat > "$work/bin/kubectl" <<'S'
+#!/bin/sh
+echo "$*" >> "$STUB_STATE/kubectl.log"
+case "$*" in
+  *"get secret harbor-teamspace-pull"*)
+    case "$*" in *"--context vpro"*) ;; *) echo "error: context does not exist" >&2; exit 1;; esac
+    [ -f "$STUB_STATE/nocred" ] && exit 0
+    case "$*" in
+      *'teknoir-demo\.username}'*) printf '%s' "$STUB_USER_B64";;
+      *'teknoir-demo\.password}'*) printf '%s' "$STUB_PASS_B64";;
+      *) exit 0;;
+    esac;;
+  *"get node"*) [ -f "$STUB_STATE/node-notready" ] && printf False || printf True;;
+  *"rollout status"*) echo "deployment successfully rolled out";;
+esac
+S
+cat > "$work/bin/curl" <<'S'
+#!/bin/sh
+echo "$*" >> "$STUB_STATE/curl.log"
+cfg=""
+case " $* " in *" --config - "*) cfg=$(cat);; esac
+for a in "$@"; do url=$a; done
+case "$url" in
+  */v2/)
+    [ -f "$STUB_STATE/tlsfail" ] && { echo "curl: (60) SSL certificate problem: unable to get local issuer certificate" >&2; exit 60; }
+    printf 401;;
+  */service/token*)
+    case "$cfg" in
+      *"user = \"$STUB_USER_PLAIN:$STUB_PASS\""*) printf '{"token":"%s","expires_in":1800}' "$STUB_TOKEN";;
+      *) printf '{"errors":[{"code":"UNAUTHORIZED","message":"unauthorized"}]}';;
+    esac;;
+  */manifests/*)
+    case "$cfg" in
+      *"Bearer $STUB_TOKEN"*) [ -f "$STUB_STATE/head403" ] && printf 403 || printf 200;;
+      *) printf 401;;
+    esac;;
+esac
+S
+cat > "$work/bin/crictl" <<'S'
+#!/bin/sh
+echo "$*" >> "$STUB_STATE/crictl.log"
+case "$1" in
+  images)
+    # -q: the image IDs; -q <ref>: the ID of that image when the device has it (only the proof image is tracked)
+    if [ -n "$3" ]; then grep -qx 'sha256:proof' "$STUB_STATE/images" 2>/dev/null && echo sha256:proof
+    else cat "$STUB_STATE/images" 2>/dev/null; fi; exit 0;;
+  rmi) echo "$2" >> "$STUB_STATE/rmi.log"; [ -f "$STUB_STATE/rmifail" ] && { echo "rmi failed" >&2; exit 1; }
+    grep -vx "$2" "$STUB_STATE/images" > "$STUB_STATE/images.new" 2>/dev/null; mv "$STUB_STATE/images.new" "$STUB_STATE/images"; exit 0;;
+  pull) [ -f "$STUB_STATE/pullfail" ] && { echo "pull failed: 403" >&2; exit 1; }
+    case "$2" in
+      ghcr.io/*)
+        # a private image: the anonymous upstream fallback answers 403, only a working Harbor mirror serves it
+        # (registries.yaml with the Harbor endpoint and a credential, not "proofdeny" = a stale credential)
+        if [ -f "$STUB_STATE/proofdeny" ] || ! grep -q 'password:' "$STUB_REG" 2>/dev/null || ! grep -q '"ghcr/\$1"' "$STUB_REG" 2>/dev/null; then
+          echo "pull failed: ghcr.io 403 (denied, mirror not used)" >&2; exit 1
+        fi
+        grep -qx 'sha256:proof' "$STUB_STATE/images" 2>/dev/null || echo sha256:proof >> "$STUB_STATE/images";;
+    esac
+    echo "Image is up to date";;
+  info) echo '{"status":{"conditions":[{"type":"RuntimeReady","status":true},{"type":"NetworkReady","status":true}]}}';;
+esac
+S
+cat > "$work/bin/systemctl" <<'S'
+#!/bin/sh
+echo "$*" >> "$STUB_STATE/systemctl.log"
+case "$1" in
+  show) cat "$STUB_STATE/unit-$2" 2>/dev/null || echo "LoadState=not-found";;
+  is-active) echo active;;
+  restart)
+    echo "$2" >> "$STUB_STATE/restarts.log"
+    if [ -f "$STUB_STATE/restart-fail-once" ]; then rm -f "$STUB_STATE/restart-fail-once"; echo "Job failed" >&2; exit 1; fi
+    # k3s rewrites containerd's hosts.toml from registries.yaml at start
+    host=$(sed -n 's|^ *- "https://\([^"]*\)"$|\1|p' "$STUB_REG" 2>/dev/null | head -1)
+    if [ -n "$host" ] && [ ! -f "$STUB_STATE/hosts-noregen" ]; then
+      # exactly what k3s v1.34.5 writes (rancher/k3s container fed registries.yaml with a rewrite)
+      printf '# File generated by k3s. DO NOT EDIT.\nserver = "https://registry-1.docker.io/v2"\ncapabilities = ["pull", "resolve", "push"]\n\n[host]\n\n[host."https://%s/v2"]\n  capabilities = ["pull", "resolve"]\n  [host."https://%s/v2".rewrite]\n    "^(.*)$" = "dockerhub/$1"\n' "$host" "$host" > "$STUB_HT"
+    else
+      printf 'server = "https://registry-1.docker.io"\n' > "$STUB_HT"
+    fi;;
+esac
+S
+printf '#!/bin/sh\necho Teknoir-Master\n' > "$work/bin/hostname"
+chmod +x "$work/bin/"*
+export STUB_USER_PLAIN="$USERNAME"
+
+unit_server() { printf 'LoadState=loaded\nKillMode=%s\nExecStart={ path=/usr/local/bin/k3s ; argv[]=/usr/local/bin/k3s server %s ; ignore_errors=no }\n%s' "${1:-process}" "${2:-}" "${3:-}" > "$S/unit-k3s"; rm -f "$S/unit-k3s-agent"; }
+unit_agent() { printf 'LoadState=loaded\nKillMode=process\nExecStart={ path=/usr/local/bin/k3s ; argv[]=/usr/local/bin/k3s agent ; ignore_errors=no }\n' > "$S/unit-k3s-agent"; rm -f "$S/unit-k3s"; }
+unit_server
+
+run() { ( cd "$repo" && ansible-playbook -i localhost, -c local --limit localhost playbooks/registry-mirror.yml \
+  -e registry_use_become=false -e registry_file_owner= -e registry_file="$REG" -e registry_backup_dir="$B" -e registry_default_data_dir="$DD" \
+  -e registry_config_yaml="$CFG" -e registry_wait_timeout=10 \
+  -e registry_kube_context=vpro -e ansible_teknoir_namespace=teknoir-demo -e ansible_teknoir_domain=test.example \
+  -e "{\"registry_local_kubectl_cmd\":[\"$work/bin/kubectl\"],\"registry_kubectl_cmd\":[\"$work/bin/kubectl\"],\"registry_crictl_cmd\":[\"$work/bin/crictl\"],\"registry_curl_cmd\":[\"$work/bin/curl\"],\"registry_systemctl_cmd\":[\"$work/bin/systemctl\"],\"registry_hostname_cmd\":[\"$work/bin/hostname\"]}" \
+  "$@" ) 2>&1 | cat; }
+# like run, but collects the output for the secret scan
+go() { local o; o=$(run "$@"); printf '%s\n' "$o" >> "$ALL"; [ -n "${SHOWALL:-}" ] && printf '=====RUN %s\n%s\n' "$*" "$o" >&2; printf '%s\n' "$o"; }
+
+fail=0
+ok() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=1; fi; }
+restarts() { [ -f "$S/restarts.log" ] && wc -l < "$S/restarts.log" || echo 0; }
+nbak() { ls "$B" 2>/dev/null | grep -c . ; }
+reset() { rm -rf "$REG" "$B" "$HT" "$S"/restarts.log "$S"/*.log "$S"/nocred "$S"/tlsfail "$S"/head403 "$S"/pullfail "$S"/restart-fail-once "$S"/hosts-noregen "$S"/proofdeny "$S"/node-notready "$S"/images "$S"/rmifail; rm -rf "$CFG" "$CFG.d" "$work"/dd-*/$HTREL; export STUB_HT="$HT"; : > "$S/kubectl.log"; unit_server; }
+HOST=harbor.test.example
+
+# ---- argument guards
+reset
+o=$(cd "$repo" && ansible-playbook -i localhost, -c local playbooks/registry-mirror.yml -e registry_kube_context=vpro 2>&1 | cat); ok "no --limit is refused" "echo \"\$o\" | grep -q 'never runs against every device'"
+one() { go -i 127.0.0.1, "$@"; }
+o=$(one --limit all); ok "--limit all is refused" "echo \"\$o\" | grep -q 'Name exactly one device' && [ ! -e $REG ]"
+o=$(one --limit 'local*'); ok "--limit with a wildcard is refused" "echo \"\$o\" | grep -q 'Name exactly one device' && [ ! -e $REG ]"
+o=$(one --limit 'localhost,127.0.0.1'); ok "--limit matching two devices is refused" "echo \"\$o\" | grep -q 'matches 2 device' && [ ! -e $REG ]"
+o=$(go -e registry_kube_context=); ok "a missing kube context is refused" "echo \"\$o\" | grep -q 'registry_kube_context' && echo \"\$o\" | grep -q 'never defaulted' && [ ! -e $REG ]"
+o=$(go -e registry_kube_context=teknoir-poc-eks); ok "a production context is refused" "echo \"\$o\" | grep -q 'production context is refused' && [ ! -e $REG ] && [ ! -s $S/kubectl.log ]"
+
+# ---- pre-flight on the device
+reset; unit_server control-group
+o=$(go); ok "KillMode other than process is refused" "echo \"\$o\" | grep -q 'no KillMode=process' && [ ! -e $REG ] && [ \$(restarts) = 0 ]"
+reset; unit_server process "--docker"
+o=$(go); ok "Docker mode is refused" "echo \"\$o\" | grep -q 'Docker mode' && [ ! -e $REG ]"
+reset; rm -f "$S/unit-k3s"
+o=$(go); ok "a device without k3s is refused" "echo \"\$o\" | grep -q 'no k3s or k3s-agent unit is loaded' && [ ! -e $REG ]"
+
+# ---- fresh install (a server)
+reset
+o=$(go); [ -n "${SHOW:-}" ] && echo "$o"; [ -n "${STOP:-}" ] && exit 0
+ok "fresh install succeeds" "echo \"\$o\" | grep -q 'failed=0' && [ -f $REG ]"
+ok "file is ours, mode 0600, with the six mirrors and the credential" "[ \"\$(head -1 $REG)\" = '# managed by teknoir' ] && [ \"\$(stat -c %a $REG)\" = 600 ] && grep -q 'rewrite' $REG && [ \$(grep -c '\"https://$HOST\"' $REG) = 6 ] && grep -q '\"dockerhub/\$1\"' $REG && grep -q '\"nvcr/\$1\"' $REG && grep -q 'password: \"$PASS\"' $REG && grep -q 'username: \"robot\$ts-teknoir-demo\"' $REG"
+ok "the file is valid YAML" "python3 -I -c 'import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert list(d[\"mirrors\"])==[\"docker.io\",\"ghcr.io\",\"gcr.io\",\"quay.io\",\"registry.k8s.io\",\"nvcr.io\"]; assert d[\"configs\"][\"$HOST\"][\"auth\"][\"password\"]==\"$PASS\"' $REG"
+ok "backup directory holds an absent-marker (there was no file)" "[ \$(nbak) = 1 ] && ls $B | grep -q '^registries.yaml.absent-' && [ \"\$(stat -c %a $B)\" = 700 ]"
+ok "k3s was restarted once" "[ \$(restarts) = 1 ]"
+ok "hosts.toml has the Harbor host and the dockerhub rewrite, the probe pull ran" "grep -qF '[host.\"https://$HOST/v2\"]' $HT && grep -qF '\"^(.*)\$\" = \"dockerhub/\$1\"' $HT && grep -q '^pull docker.io/rancher/mirrored-pause:3.6' $S/crictl.log"
+ok "the private proof image was pulled after the restart" "grep -q '^pull ghcr.io/teknoir/observatory-event-processing-app:latest' $S/crictl.log"
+ok "the probe ran from the device before the write: /v2/, token, HEAD" "grep -q '/v2/\$' $S/curl.log && grep -q '/service/token?service=harbor-registry&scope=repository:dockerhub/rancher/mirrored-pause:pull' $S/curl.log && grep -q -- '-I' $S/curl.log && grep -q 'manifests/3.6' $S/curl.log"
+ok "the credential never appears in a curl argument list" "! grep -q -e '$PASS' -e '$TOKEN' -e 'robot\$ts' $S/curl.log"
+ok "only the two credential keys were fetched, no whole Secret" "[ \$(grep -c 'get secret harbor-teamspace-pull' $S/kubectl.log) = 2 ] && ! grep -qE ' -o (json|yaml)( |\$)' $S/kubectl.log && grep -q -- '--context vpro' $S/kubectl.log"
+ok "server: node and TOE were waited for" "grep -q 'get node teknoir-master' $S/kubectl.log && grep -q 'rollout status deploy/toe' $S/kubectl.log"
+ok "no temporary diff file is left behind" "[ -z \"\$(ls ${TMPDIR:-/tmp} 2>/dev/null | grep '^registry-mirror-diff\\.')\" ]"
+
+# ---- re-run: nothing changes, no restart
+n=$(nbak); r=$(restarts); ino=$(stat -c %i "$REG")
+o=$(go); ok "re-run is a no-op (no write, no backup, no restart)" "echo \"\$o\" | grep -q 'failed=0' && echo \"\$o\" | grep -q 'already in place' && [ \$(nbak) = $n ] && [ \$(restarts) = $r ] && [ \$(stat -c %i $REG) = $ino ]"
+
+# ---- --check --diff: the probe runs, nothing is changed, the diff is redacted
+reset
+o=$(go --check --diff)
+ok "--check changes nothing (no file, no backup, no restart)" "[ ! -e $REG ] && [ ! -d $B ] && [ \$(restarts) = 0 ]"
+ok "--check ran the probe" "grep -q '/service/token' $S/curl.log && grep -q 'manifests/3.6' $S/curl.log"
+ok "--check --diff shows the redacted diff" "echo \"\$o\" | grep -q '^+password: \"\\*\\*\\*\\*\\*\\*\\*\\*\"\\|^+      password: \"\\*\\*\\*\\*\\*\\*\\*\\*\"' && echo \"\$o\" | grep -q 'managed by teknoir'"
+ok "--check --diff never shows the password" "! echo \"\$o\" | grep -q '$PASS'"
+# a changed credential: the diff has no visible change in the file, the plan says so
+go >/dev/null
+export STUB_PASS_B64=$(printf '%s' "$PASS2" | base64 -w0) STUB_PASS="$PASS2"
+o=$(go --check --diff); ok "--check with a new credential: says only the credential changes, shows no password" "echo \"\$o\" | grep -q 'only the credential changes' && ! echo \"\$o\" | grep -q -e '$PASS' -e '$PASS2'"
+unset STUB_PASS_B64; export STUB_PASS_B64=$(printf '%s' "$PASS" | base64 -w0) STUB_PASS="$PASS"
+
+# ---- a rotated credential is written, k3s restarted, a second backup exists
+export STUB_PASS_B64=$(printf '%s' "$PASS2" | base64 -w0) STUB_PASS="$PASS2"
+sleep 1; n=$(nbak); r=$(restarts)
+o=$(go); ok "a rotated credential is written and k3s restarted" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'password: \"$PASS2\"' $REG && [ \$(restarts) = $((r+1)) ] && [ \$(nbak) = $((n+1)) ]"
+ok "the new backup is the previous file" "grep -q 'password: \"$PASS\"' \"\$(ls $B/registries.yaml.bak-* | tail -1)\" && [ \"\$(stat -c %a \$(ls $B/registries.yaml.bak-* | tail -1))\" = 600 ]"
+
+# ---- rollback restores the newest backup
+r=$(restarts)
+sleep 1
+o=$(go -e registry_rollback=true -e registry_kube_context=); ok "rollback restores the previous credential (needs no kube context)" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'password: \"$PASS\"' $REG && [ \$(restarts) = $((r+1)) ] && ls $B | grep -q 'pre-rollback'"
+r=$(restarts)
+o=$(go -e registry_rollback=true -e registry_backup=$(ls "$B"/registries.yaml.absent-* | head -1)); ok "rollback to the absent-marker removes the file" "echo \"\$o\" | grep -q 'failed=0' && [ ! -e $REG ] && [ \$(restarts) = $((r+1)) ]"
+r=$(restarts)
+o=$(go -e registry_rollback=true -e registry_backup=$(ls "$B"/registries.yaml.absent-* | head -1)); ok "rollback to the absent-marker again: nothing to do, no restart" "echo \"\$o\" | grep -q 'failed=0' && [ \$(restarts) = $r ]"
+o=$(go -e registry_rollback=true -e registry_backup="$work/nonexistent"); ok "rollback with a missing backup fails" "echo \"\$o\" | grep -q 'failed=1'"
+reset
+o=$(go -e registry_rollback=true); ok "rollback without any backup is refused" "echo \"\$o\" | grep -q 'No backup in' && [ \$(restarts) = 0 ]"
+export STUB_PASS_B64=$(printf '%s' "$PASS" | base64 -w0) STUB_PASS="$PASS"
+
+# ---- rollback picks the newest backup by its timestamp, whatever its kind (absent-* sorts before bak-* by name)
+reset
+mkdir -p "$B"; chmod 700 "$B"
+printf '# managed by teknoir\n# older-bak\nmirrors: {}\n' > "$B/registries.yaml.bak-20260101T000000Z"
+: > "$B/registries.yaml.absent-20260201T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true); ok "rollback: a newer absent-marker wins over an older bak" "echo \"\$o\" | grep -q 'failed=0' && [ ! -e $REG ]"
+reset
+mkdir -p "$B"; chmod 700 "$B"
+: > "$B/registries.yaml.absent-20260101T000000Z"
+printf '# managed by teknoir\n# newer-bak\nmirrors: {}\n' > "$B/registries.yaml.bak-20260201T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true); ok "rollback: a newer bak wins over an older absent-marker" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'newer-bak' $REG"
+
+# ---- registry_rollback_to=original: the pre-mirror state, however many managed generations came after it
+reset
+mkdir -p "$B"; chmod 700 "$B"
+printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://owner-mirror.example"\n' > "$B/registries.yaml.bak-20260101T000000Z"
+printf '# managed by teknoir\n# gen1\nmirrors: {}\n' > "$B/registries.yaml.bak-20260201T000000Z"
+printf '# managed by teknoir\n# gen2\nmirrors: {}\n' > "$B/registries.yaml.bak-20260301T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true); ok "rollback (newest) with two managed generations restores the previous managed file" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'gen2' $REG"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true -e registry_rollback_to=original); ok "rollback_to=original restores the owner's file from before the first run" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'owner-mirror.example' $REG && ! grep -q 'managed by' $REG"
+reset
+mkdir -p "$B"; chmod 700 "$B"
+: > "$B/registries.yaml.absent-20260101T000000Z"
+printf '# managed by teknoir\n# gen1\nmirrors: {}\n' > "$B/registries.yaml.bak-20260201T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true -e registry_rollback_to=original); ok "rollback_to=original with no file before the first run removes the mirror file" "echo \"\$o\" | grep -q 'failed=0' && [ ! -e $REG ]"
+o=$(go -e registry_rollback=true -e registry_rollback_to=sideways); ok "an unknown registry_rollback_to is refused" "echo \"\$o\" | grep -q 'must be newest or original'"
+
+# ---- a file that is not ours
+reset
+printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://mine.example"\n' > "$REG"; cp "$REG" "$work/foreign"
+o=$(go); ok "a foreign registries.yaml is refused and untouched" "echo \"\$o\" | grep -q 'belongs to the device owner' && cmp -s $REG $work/foreign && [ ! -d $B ] && [ \$(restarts) = 0 ] && [ ! -s $S/curl.log ]"
+o=$(go --check --diff); ok "a foreign registries.yaml is refused in --check too" "echo \"\$o\" | grep -q 'belongs to the device owner' && cmp -s $REG $work/foreign"
+o=$(go -e registry_allow_replace=true); ok "registry_allow_replace=true replaces it and keeps a backup" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'managed by teknoir' $REG && cmp -s \"\$(ls $B/registries.yaml.bak-* | head -1)\" $work/foreign && [ \$(restarts) = 1 ]"
+# --diff of an allowed replacement must not print the owner's credentials (auth, identity_token, token, password)
+reset
+FAUTH='Zm9yZWlnbjpmb3JlaWduLXNlY3JldA'; FIDT='ForeignIdentityTokenValue1'; FTOK='ForeignBearerTokenValue2'; FPW='ForeignPasswordValue3'
+printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://mine.example"\nconfigs:\n  "mine.example":\n    auth:\n      username: "u"\n      password: "%s"\n      auth: "%s"\n      identity_token: "%s"\n    token: %s\n  "inline.example": {auth: {password: %s}}\n' "$FPW" "$FAUTH" "$FIDT" "$FTOK" "$FPW" > "$REG"; cp "$REG" "$work/foreign2"
+o=$(go -e registry_allow_replace=true --check --diff)
+ok "--check --diff of a foreign file shows none of the owner's credentials and not the file" "echo \"\$o\" | grep -q 'failed=0' && ! echo \"\$o\" | grep -q -e '$FAUTH' -e '$FIDT' -e '$FTOK' -e '$FPW' -e 'mine.example' && echo \"\$o\" | grep -q 'belongs to the device owner; not shown'"
+o=$(go -e registry_allow_replace=true --diff)
+ok "--diff of a foreign file replacement shows none of the owner's credentials either" "echo \"\$o\" | grep -q 'failed=0' && ! echo \"\$o\" | grep -q -e '$FAUTH' -e '$FIDT' -e '$FTOK' -e '$FPW' && cmp -s \"\$(ls $B/registries.yaml.bak-* | head -1)\" $work/foreign2"
+ok "the owner's credentials appear in no output of any run" "! grep -q -e '$FAUTH' -e '$FIDT' -e '$FTOK' -e '$FPW' $ALL"
+reset
+printf '# managed by tnctl bootstrap\nmirrors: {}\n' > "$REG"
+o=$(go); ok "a file written by tnctl bootstrap counts as ours" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'managed by teknoir' $REG && ls $B | grep -q '^registries.yaml.bak-'"
+reset
+printf '# not managed by teknoir\nmirrors: {}\n' > "$REG"
+o=$(go); ok "a comment that merely contains the marker text is foreign" "echo \"\$o\" | grep -q 'belongs to the device owner'"
+
+# ---- probe failures stop the run before anything changes
+probe_fails() { # <description> <setup> <expected message>
+  reset; eval "$2"
+  o=$(go)
+  ok "$1: refused before any change" "echo \"\$o\" | grep -q '$3' && [ ! -e $REG ] && [ ! -d $B ] && [ \$(restarts) = 0 ]"
+}
+probe_fails "TLS not trusted" "touch $S/tlsfail" 'curl exit code 60'
+probe_fails "no credential in the platform Secret" "touch $S/nocred" 'no usable credential for teamspace teknoir-demo'
+probe_fails "Harbor refuses the credential" "export STUB_USER_PLAIN=someone-else" 'gave no token'
+export STUB_USER_PLAIN="$USERNAME"
+probe_fails "Harbor does not serve the probe image" "touch $S/head403" 'answered'
+printf 'x' > /dev/null
+ok "a failed probe leaves the credential out of the output" "! grep -q -e '$PASS' -e '$PASS2' -e '$TOKEN' $ALL"
+
+# ---- failures after the write roll back
+reset
+printf '# managed by teknoir\nmirrors:\n  docker.io:\n    endpoint:\n      - "https://old.example"\nconfigs:\n  "old.example":\n    auth:\n      username: "u"\n      password: "oldpw"\n' > "$REG"; cp "$REG" "$work/ours"
+touch "$S/pullfail"
+o=$(go); ok "failed probe pull restores the previous file and fails" "echo \"\$o\" | grep -q 'failed=1' && cmp -s $REG $work/ours && echo \"\$o\" | grep -q 'restored' && [ \$(restarts) = 2 ]"
+ok "after the rollback the old configuration was restarted and waited for" "[ \$(restarts) = 2 ] && [ \$(grep -c 'rollout status' $S/kubectl.log) = 2 ]"
+reset; touch "$S/pullfail"
+o=$(go); ok "failed probe pull on a fresh device removes the file again" "echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ] && echo \"\$o\" | grep -q 'removed (there was none)' && [ \$(restarts) = 2 ]"
+reset; touch "$S/proofdeny"
+o=$(go); ok "a mirror that containerd does not use (private proof pull denied) rolls back" "echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ] && echo \"\$o\" | grep -q 'removed (there was none)' && grep -q '^pull docker.io/rancher/mirrored-pause:3.6' $S/crictl.log && [ \$(restarts) = 2 ]"
+reset
+o=$(go -e registry_proof_image=ghcr.io/teknoir/other:1); ok "registry_proof_image overrides the proof image" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^pull ghcr.io/teknoir/other:1' $S/crictl.log && ! grep -q 'observatory-event-processing-app' $S/crictl.log"
+reset; touch "$S/restart-fail-once"
+o=$(go); ok "a failed restart is rolled back too" "echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ] && [ \$(restarts) = 2 ]"
+reset; touch "$S/hosts-noregen"
+o=$(go -e registry_wait_timeout=5); ok "hosts.toml without the Harbor project is a failure that rolls back" "echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ]"
+reset; touch "$S/node-notready"
+o=$(go -e registry_wait_timeout=5); ok "a node that does not become Ready is a failure that rolls back" "echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ]"
+ok "rollbacks leave the credential out of the output" "! grep -q -e '$PASS' -e '$PASS2' -e '$TOKEN' $ALL"
+
+# ---- the node name of a server
+reset; printf 'write-kubeconfig-mode: "0644"\nnode-name: "mobile-01-vision"\n' > "$CFG"
+o=$(go); ok "server: the node name comes from config.yaml" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'get node mobile-01-vision' $S/kubectl.log"
+reset; rm -f "$CFG"
+o=$(go -e registry_node_name=custom-node); ok "server: registry_node_name overrides it" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'get node custom-node' $S/kubectl.log"
+rm -f "$CFG"
+
+# ---- the proof image does not stay on the device unless it was there before
+reset
+o=$(go); ok "proof image: pulled for the proof and removed again when the device did not have it" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^pull ghcr.io/teknoir/observatory-event-processing-app:latest' $S/crictl.log && grep -qx 'rmi sha256:proof' <(grep '^rmi' $S/crictl.log) && ! grep -qx 'sha256:proof' $S/images"
+reset; echo sha256:proof > "$S/images"
+o=$(go); ok "proof image: kept when the device had it before (no rmi)" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^pull ghcr.io/teknoir/observatory' $S/crictl.log && ! grep -q '^rmi' $S/crictl.log && grep -qx 'sha256:proof' $S/images"
+reset; touch "$S/rmifail"
+o=$(go); ok "proof image: a failed rmi does not fail the run or roll back" "echo \"\$o\" | grep -q 'failed=0' && [ -f $REG ] && [ \$(restarts) = 1 ] && grep -q '^rmi' $S/crictl.log"
+reset
+o=$(go -e registry_proof_image=ghcr.io/teknoir/other:1); ok "proof image: a registry_proof_image override is tracked the same way" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^rmi sha256:proof' $S/crictl.log"
+
+# ---- k3s data directory: default, config.yaml, drop-ins (later wins), the unit's --data-dir, and a missing agent dir
+dd_dir() { mkdir -p "$1/agent/etc/containerd/certs.d/docker.io"; }
+dd_dir "$work/dd-cfg"; dd_dir "$work/dd-a"; dd_dir "$work/dd-b"; dd_dir "$work/dd-cli"; dd_dir "$work/dd-lower"; dd_dir "$work/dd-upper"; dd_dir "$work/dd-env"; dd_dir "$work/dd-env2"
+reset
+o=$(go); ok "data-dir default: hosts.toml is read under the default data directory" "echo \"\$o\" | grep -q 'failed=0' && [ -f $DD/$HTREL ]"
+reset; printf 'write-kubeconfig-mode: "0644"\ndata-dir: %s\n' "$work/dd-cfg" > "$CFG"; export STUB_HT="$work/dd-cfg/$HTREL"
+o=$(go); ok "data-dir from config.yaml: hosts.toml is read there" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cfg/$HTREL ] && [ ! -e $DD/$HTREL ]"
+reset; printf 'data-dir: "%s"\n' "$work/dd-cfg" > "$CFG"; mkdir -p "$CFG.d"
+printf 'data-dir: %s\n' "$work/dd-a" > "$CFG.d/10-a.yaml"; printf "data-dir: '%s'\n" "$work/dd-b" > "$CFG.d/20-b.yml"; printf 'data-dir: /nonexistent\n' > "$CFG.d/30-ignored.txt"
+export STUB_HT="$work/dd-b/$HTREL"
+o=$(go); ok "data-dir drop-ins: the last file in name order overrides config.yaml and earlier drop-ins (and a .txt is ignored)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-b/$HTREL ] && [ ! -e $work/dd-a/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ] && [ ! -e $DD/$HTREL ]"
+reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "--data-dir $work/dd-cli --other"; export STUB_HT="$work/dd-cli/$HTREL"
+o=$(go); ok "data-dir from the unit's ExecStart wins over config.yaml" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
+reset; unit_server process "-d=$work/dd-cli"; export STUB_HT="$work/dd-cli/$HTREL"
+o=$(go); ok "data-dir from the unit's -d=<dir>" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ]"
+# drop-ins in BYTE order like k3s (os.ReadDir): B.yaml sorts before a.yaml, so a.yaml is applied last and wins
+reset; mkdir -p "$CFG.d"; printf 'data-dir: %s\n' "$work/dd-upper" > "$CFG.d/B.yaml"; printf 'data-dir: %s\n' "$work/dd-lower" > "$CFG.d/a.yaml"
+export STUB_HT="$work/dd-lower/$HTREL"
+o=$(go); ok "data-dir drop-ins: byte order like k3s (B.yaml before a.yaml, so a.yaml wins)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-lower/$HTREL ] && [ ! -e $work/dd-upper/$HTREL ]"
+# K3S_DATA_DIR of the unit: Environment= and EnvironmentFiles= (install.sh writes k3s.service.env, quoted or not)
+reset; unit_server process "" "Environment=K3S_DATA_DIR=$work/dd-env"; export STUB_HT="$work/dd-env/$HTREL"
+o=$(go); ok "data-dir from K3S_DATA_DIR in Environment= of the unit" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-env/$HTREL ] && [ ! -e $DD/$HTREL ]"
+printf "K3S_TOKEN='SECRETenvTOKEN'\nK3S_DATA_DIR='%s'\n" "$work/dd-env2" > "$work/k3s.service.env"; chmod 600 "$work/k3s.service.env"
+reset; unit_server process "" "EnvironmentFiles=$work/k3s.service.env (ignore_errors=yes)"; export STUB_HT="$work/dd-env2/$HTREL"
+o=$(go -v); ok "data-dir from K3S_DATA_DIR in an EnvironmentFile (and the token in it is never printed)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-env2/$HTREL ] && ! echo \"\$o\" | grep -q SECRETenvTOKEN"
+reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "" "EnvironmentFiles=$work/k3s.service.env (ignore_errors=yes)"; export STUB_HT="$work/dd-cfg/$HTREL"
+o=$(go); ok "data-dir precedence: config.yaml beats K3S_DATA_DIR" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cfg/$HTREL ] && [ ! -e $work/dd-env2/$HTREL ]"
+reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "--data-dir $work/dd-cli" "Environment=K3S_DATA_DIR=$work/dd-env"; export STUB_HT="$work/dd-cli/$HTREL"
+o=$(go); ok "data-dir precedence: the CLI flag beats config.yaml and K3S_DATA_DIR" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ] && [ ! -e $work/dd-env/$HTREL ]"
+# a non-default config path: --config/-c of the unit, or K3S_CONFIG_FILE (the .d directory sits next to it)
+ALT="$work/alt/k3s.yaml"; mkdir -p "$work/alt"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt"; printf 'data-dir: %s\n' "$work/dd-a" > "$ALT"; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"
+unit_server process "--config $ALT"; export STUB_HT="$work/dd-a/$HTREL"
+o=$(go); ok "config path from --config of the unit (the default config.yaml is not read)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt/k3s.yaml.d"; printf 'data-dir: %s\n' "$work/dd-a" > "$ALT"; printf 'data-dir: %s\n' "$work/dd-b" > "$ALT.d/10.yaml"
+unit_server process "-c=$ALT"; export STUB_HT="$work/dd-b/$HTREL"
+o=$(go); ok "config path from -c=<file>: its .d drop-ins are read too" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-b/$HTREL ] && [ ! -e $work/dd-a/$HTREL ]"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt"; printf 'data-dir: %s\n' "$work/dd-a" > "$ALT"; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"
+unit_server process "" "Environment=K3S_URL=https://x:6443 K3S_CONFIG_FILE=$ALT"; export STUB_HT="$work/dd-a/$HTREL"
+o=$(go); ok "config path from K3S_CONFIG_FILE of the unit" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt"; printf 'data-dir: %s\n' "$work/missing" > "$ALT"
+unit_server process "--config $ALT"
+o=$(go); ok "a missing agent dir from an env/--config source is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ ! -d $B ] && [ \$(restarts) = 0 ] && ! grep -q 'get secret' $S/kubectl.log && [ ! -s $S/curl.log ]"
+reset; unit_server process "" "Environment=K3S_DATA_DIR=$work/missing-env"
+o=$(go); ok "a K3S_DATA_DIR without an agent dir is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ \$(restarts) = 0 ] && ! grep -q 'get secret' $S/kubectl.log"
+reset; export STUB_HT="$work/dd-a/$HTREL"
+o=$(go -e registry_data_dir="$work/dd-a"); ok "-e registry_data_dir overrides the search" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ]"
+reset; printf 'data-dir: %s\n' "$work/missing" > "$CFG"
+o=$(go); ok "data-dir without an agent dir is refused before any change (no file, no backup, no restart, no probe, no credential)" "echo \"\$o\" | grep -q 'has no agent directory' && echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ] && [ ! -d $B ] && [ \$(restarts) = 0 ] && [ ! -s $S/curl.log ] && ! grep -q 'get secret' $S/kubectl.log && [ ! -e $S/crictl.log ]"
+reset; printf 'data-dir: relative/dir\n' > "$CFG"
+o=$(go); ok "a relative data-dir is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ \$(restarts) = 0 ]"
+reset
+o=$(go -e registry_default_data_dir="$work/nope"); ok "a missing default data directory is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ \$(restarts) = 0 ]"
+reset; mkdir -p "$B"; chmod 700 "$B"; printf '# managed by teknoir\n# prev\nmirrors: {}\n' > "$B/registries.yaml.bak-20260101T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true -e registry_default_data_dir="$work/nope"); ok "rollback does not need the data directory" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'prev' $REG"
+reset; export STUB_HT="$HT"
+
+# ---- an agent: no apiserver to ask
+reset; unit_agent
+o=$(go); ok "agent: installs, waits for containerd, asks no apiserver" "echo \"\$o\" | grep -q 'failed=0' && [ -f $REG ] && grep -q 'info' $S/crictl.log && ! grep -q -e 'get node' -e 'rollout' $S/kubectl.log && grep -q 'restart k3s-agent' $S/systemctl.log"
+
+# ---- nothing secret in any output, also with -vvv
+reset
+o=$(go -vvv); ok "-vvv run succeeds" "echo \"\$o\" | grep -q 'failed=0'"
+reset
+o=$(go -vvv --check --diff); ok "-vvv --check --diff run succeeds" "echo \"\$o\" | grep -q 'failed=0'"
+ok "the password, the token and the robot secret appear in no output of any run" "! grep -q -e '$PASS' -e '$PASS2' -e '$TOKEN' -e '$STUB_PASS_B64' $ALL"
+
+exit $fail

@@ -1,0 +1,772 @@
+---
+# Registry mirror for an existing robot: write /etc/rancher/k3s/registries.yaml so the device pulls its images
+# through the Harbor pull-through cache (projects dockerhub, ghcr, gcr, quay, k8s, nvcr of the platform's Harbor),
+# with the upstream registry as the fallback (k3s always tries its default endpoint last, so a Harbor outage never
+# blocks public images). Design: plans/harbor-proxy-staging.md. New robots get the same file from `tnctl bootstrap
+# --registry-mirror`; this playbook is for robots that already run.
+#
+# What it does, per device (serial 1, the run stops at the first failure):
+#   1. pre-flight on the device: a k3s (server) or k3s-agent unit, not Docker mode, KillMode=process (a k3s restart
+#      then leaves the pods running; any other KillMode kills them), and a registries.yaml that this playbook (or
+#      `tnctl bootstrap`) did not write is refused unless -e registry_allow_replace=true, and k3s's data directory
+#      (custom data-dir: see registry_data_dir) must have an agent directory,
+#   2. reads the device's pull credential from the platform, on the controller (no_log): Secret
+#      teknoir-system/harbor-teamspace-pull of the kube context registry_kube_context, keys <namespace>.username and
+#      <namespace>.password (namespace = ansible_teknoir_namespace). Only those two keys are fetched,
+#   3. probes Harbor FROM THE DEVICE before anything is changed: https://<host>/v2/ answers 401 with a valid TLS chain,
+#      then a token for repository:dockerhub/rancher/mirrored-pause:pull and a HEAD of that manifest answer 200. The
+#      credential goes to curl on stdin (a curl config), never in an argument list. A failed probe stops the run,
+#   4. prints a redacted --diff of registries.yaml (password/auth/identity_token/token values show as ********; a file
+#      of the device owner, with registry_allow_replace=true, is not printed at all),
+#   5. backs the current file up to registry_backup_dir (registries.yaml.bak-<UTC>, or registries.yaml.absent-<UTC>
+#      when there was none), outside the k3s directories,
+#   6. writes the file (root, 0600),
+#   7. restarts k3s ONLY when the file changed, then waits: on a server the node and the TOE are Ready, on an agent the
+#      unit is active and containerd reports runtime and network ready,
+#   8. checks that containerd's docker.io hosts.toml has the host `https://<host>/v2` with the rewrite `^(.*)$` ->
+#      `dockerhub/$1`, pulls rancher/mirrored-pause with `k3s crictl pull`, and then pulls a small PRIVATE ghcr.io image
+#      (registry_proof_image): the anonymous upstream fallback cannot serve it, so the pull proves that containerd
+#      really went through Harbor with the credential (the public probe alone passes via the fallback too),
+#      The proof image is removed again afterwards unless the device had it before.
+#   9. on any failure after step 6: restores the backup (or removes the file), restarts k3s, waits, then fails.
+#
+#   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_kube_context=vpro
+#
+#   # Only look: steps 1 to 4 (the probe runs, it only reads), changes nothing
+#   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_kube_context=vpro --check --diff
+#
+#   # Roll back: restore the newest backup (or -e registry_backup=<file>), restart k3s if the file changes, wait
+#   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_rollback=true
+#   # Remove the mirror: restore the state from before the first run (the oldest backup: the owner's file, or
+#   # "there was none" and the file is removed), however many credential rotations came since
+#   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_rollback=true -e registry_rollback_to=original
+#
+# Variables
+#   registry_kube_context  required (not with registry_rollback): the kubectl context of the platform cluster that
+#                          holds the credential Secret, for example vpro. Never defaulted.
+#   registry_host          default harbor.<ansible_teknoir_domain>
+#   registry_rollback      default false. true restores a backup instead (no credential, no probe).
+#   registry_rollback_to   with registry_rollback: newest (default: undo the last change; after a re-run for a rotated
+#                          credential this puts back the previous Harbor file) or original (the oldest backup in
+#                          registry_backup_dir: the pre-mirror state; removes the mirror).
+#   registry_backup        with registry_rollback: the backup file to restore (default: the newest in registry_backup_dir).
+#   registry_allow_replace default false. Replace a registries.yaml that this playbook did not write.
+#   registry_allow_many    default false. Allow --limit all / a wildcard / a pattern that matches more than one device.
+#   registry_proof_image   a small private multi-arch ghcr.io/teknoir image that the proof pull fetches (default
+#                          ghcr.io/teknoir/observatory-event-processing-app:latest, ~100 MB). Must not be public. It is
+#                          removed from the device after the proof unless the device had it before.
+#   registry_wait_timeout  seconds to wait for k3s after a restart, default 300.
+#   registry_data_dir      k3s's data directory, default: found from the unit's --data-dir, config.yaml and config.yaml.d/*.yaml
+#                          (a command line flag wins, a later drop-in wins), else /var/lib/rancher/k3s. containerd's hosts.toml
+#                          is read from <data-dir>/agent/etc/containerd/certs.d/docker.io/hosts.toml (registry_hosts_toml
+#                          overrides the whole path). The run is refused before any change when <data-dir>/agent does not exist.
+#   registry_node_name     the node's name on a server, default: node-name of /etc/rancher/k3s/config.yaml, else the host name.
+#   registry_file, registry_file_owner, registry_backup_dir, registry_hosts_toml, registry_config_yaml, registry_*_cmd,
+#   registry_use_become:
+#                          where things are; the defaults fit a Teknoir device. They exist so the playbook can be tried
+#                          against a throwaway target (README).
+#
+# Roll out: a VM device first, then one robot at a time (check TOE Ready and the pods after each). Production devices
+# only with the usual production OK. Multi-node robots: the agent nodes are not in the tnctl inventory and keep pulling
+# from upstream (delegate through the server, like join-robot-agent.yml, is the follow-up).
+
+- name: Registry mirror (Harbor pull-through cache) for a robot, with probe, backup and rollback
+  hosts: all
+  gather_facts: false
+  serial: 1
+  max_fail_percentage: 0
+  any_errors_fatal: true
+  vars:
+    registry_kube_context: ""
+    registry_host: "harbor.{{ ansible_teknoir_domain | default('') }}"
+    registry_rollback: false
+    registry_rollback_to: newest
+    registry_backup: ""
+    registry_allow_replace: false
+    registry_allow_many: false
+    registry_wait_timeout: 300
+    registry_node_name: ""
+    registry_credential_secret: harbor-teamspace-pull
+    registry_credential_namespace: teknoir-system
+    registry_file: /etc/rancher/k3s/registries.yaml
+    registry_config_yaml: /etc/rancher/k3s/config.yaml
+    registry_backup_dir: /var/lib/rancher/k3s/registry-mirror-backups
+    # k3s's data directory: found in pre-flight (the unit's --data-dir, then config.yaml and config.yaml.d/*.yaml, else
+    # this default). -e registry_data_dir=<dir> skips the search. registry_hosts_toml empty: <data-dir>/agent/etc/containerd/
+    # certs.d/docker.io/hosts.toml.
+    registry_default_data_dir: /var/lib/rancher/k3s
+    registry_data_dir: ""
+    registry_hosts_toml: ""
+    registry_toe_namespace: kube-system
+    registry_toe_deployment: toe
+    registry_local_kubectl_cmd: [kubectl]
+    registry_kubectl_cmd: [k3s, kubectl]
+    registry_crictl_cmd: [k3s, crictl]
+    registry_curl_cmd: [curl]
+    registry_systemctl_cmd: [systemctl]
+    registry_hostname_cmd: [hostname]
+    registry_use_become: true
+    # Owner and group of registries.yaml (it holds a credential); empty leaves them (for a throwaway target).
+    registry_file_owner: root
+    # The file is ours when its first line is one of these (`tnctl bootstrap` writes the second).
+    registry_markers: ["# managed by teknoir", "# managed by tnctl bootstrap"]
+    registry_mirrors:
+      docker.io: dockerhub
+      ghcr.io: ghcr
+      gcr.io: gcr
+      quay.io: quay
+      registry.k8s.io: k8s
+      nvcr.io: nvcr
+    # The probe image: tiny, public, on every k3s device (a k3s system image).
+    registry_probe_repo: dockerhub/rancher/mirrored-pause
+    registry_probe_tag: "3.6"
+    registry_probe_pull: docker.io/rancher/mirrored-pause:3.6
+    # The mirror proof: a small PRIVATE multi-arch (amd64, arm64) ghcr.io/teknoir image, ~100 MB. The anonymous upstream
+    # fallback answers 403 for it, so only Harbor (ghcr project, with the robot credential) can serve it. Override with
+    # -e registry_proof_image=<another private ghcr.io/teknoir image> if this one is gone. Never a public image.
+    registry_proof_image: ghcr.io/teknoir/observatory-event-processing-app:latest
+    registry_host_re: '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$'
+    # What a credential may contain: it goes into a YAML file and a curl config. A Harbor robot is robot$name.
+    registry_cred_re: '^[A-Za-z0-9$_.~+=@%:/-]+$'
+    # The lines of registries.yaml that carry a credential (password, auth = base64 user:pass, identity_token, token),
+    # for the redacted copies. A key with a nested mapping (our own `auth:` header) has no value and is left alone.
+    registry_redact_re: '(?mi)^([ \t]*["'']?(?:password|passwd|auth|identity_?token|token)["'']?[ \t]*:[ \t]*)(?=\S).*$'
+    registry_redact_to: '\1"********"'
+    registry_accept: "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+  become: "{{ registry_use_become | bool }}"
+
+  tasks:
+    - name: Refuse to run without --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Pass --limit <device>. This playbook never runs against every device."
+        quiet: true
+
+    - name: Refuse --limit all, wildcards and patterns that match more than one device
+      ansible.builtin.assert:
+        that:
+          - registry_allow_many | bool or ansible_limit is not search('(^|[,:])\s*all\s*([,:]|$)')
+          - registry_allow_many | bool or ansible_limit is not search('[*?~!&\[]')
+          - registry_allow_many | bool or ansible_play_hosts_all | length == 1
+        fail_msg: >-
+          --limit '{{ ansible_limit }}' matches {{ ansible_play_hosts_all | length }} device(s). Name exactly one device;
+          roll out one device at a time (a VM first). To change several on purpose pass -e registry_allow_many=true.
+        quiet: true
+
+    - name: Refuse without a kube context for the credential (never defaulted)
+      ansible.builtin.assert:
+        that:
+          - registry_kube_context is string
+          - registry_kube_context | length > 0
+          - registry_kube_context is not search('(online|eks|prod)')
+        fail_msg: >-
+          Pass -e registry_kube_context=<kubectl context of the platform cluster that holds
+          {{ registry_credential_namespace }}/{{ registry_credential_secret }}>, for example vpro. The context is never defaulted,
+          and a production context is refused (production is frozen until the new cluster).
+        quiet: true
+      when: not (registry_rollback | bool)
+
+    - name: Refuse without the namespace and domain of the device (tnctl inventory hostvars)
+      ansible.builtin.assert:
+        that:
+          - ansible_teknoir_namespace is defined
+          - ansible_teknoir_namespace | length > 0
+          - registry_host is match(registry_host_re)
+        fail_msg: >-
+          {{ inventory_hostname }}: needs ansible_teknoir_namespace (the key of its credential in the Secret) and a valid
+          registry_host (default harbor.<ansible_teknoir_domain>). Run it through tnctl (tnctl ansible-playbook), or pass
+          -e registry_host=<host> -e ansible_teknoir_namespace=<namespace>.
+        quiet: true
+      when: not (registry_rollback | bool)
+
+    # ------------------------------------------------------------------ 1. pre-flight on the device
+    - name: Which k3s units does the device have
+      ansible.builtin.command:
+        argv: "{{ registry_systemctl_cmd + ['show', unit, '-p', 'LoadState', '-p', 'KillMode', '-p', 'ExecStart', '-p', 'Environment', '-p', 'EnvironmentFiles', '--no-pager'] }}"
+      loop: [k3s, k3s-agent]
+      loop_control:
+        loop_var: unit
+        label: "{{ unit }}"
+      register: registry_units
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: The k3s unit and its properties
+      ansible.builtin.set_fact:
+        registry_unit: "{{ registry_loaded[0] if registry_loaded | length > 0 else '' }}"
+        registry_unit_props: "{{ registry_loaded_props[0] if registry_loaded_props | length > 0 else '' }}"
+      vars:
+        registry_loaded: "{{ registry_units.results | selectattr('stdout', 'search', '(?m)^LoadState=loaded$') | map(attribute='unit') | list }}"
+        registry_loaded_props: "{{ registry_units.results | selectattr('stdout', 'search', '(?m)^LoadState=loaded$') | map(attribute='stdout') | list }}"
+
+    - name: Refuse a device without k3s, with Docker mode, or whose restart would kill the pods
+      ansible.builtin.assert:
+        that:
+          - registry_unit != ''
+          - registry_unit_props is not search('--docker')
+          - registry_unit_props is search('(?m)^KillMode=process$')
+        fail_msg: >-
+          {{ inventory_hostname }}: {{
+          'no k3s or k3s-agent unit is loaded' if registry_unit == '' else
+          ('the ' ~ registry_unit ~ ' unit runs in Docker mode (--docker); registries.yaml is for containerd') if registry_unit_props is search('--docker') else
+          ('the ' ~ registry_unit ~ ' unit has no KillMode=process, so a restart of k3s would stop every pod on the device')
+          }}. Nothing was changed.
+        quiet: true
+
+    - name: Role of the device
+      ansible.builtin.set_fact:
+        registry_is_server: "{{ registry_unit == 'k3s' }}"
+
+    # k3s's data directory (a robot bootstrapped with a custom data-dir keeps containerd's hosts.toml there). Same semantics
+    # as cli/pkg/templates/scripts/tn-k3s-ca.sh: a command line flag (ExecStart --data-dir/-d) wins over the config files,
+    # config.yaml.d/*.yaml are read in byte order (k3s: os.ReadDir) after config.yaml and a later file overrides an earlier
+    # one, then K3S_DATA_DIR of the unit (Environment=, EnvironmentFiles=; install.sh writes k3s.service.env), then the
+    # default. The config file is --config/-c of the unit, else K3S_CONFIG_FILE, else registry_config_yaml.
+    # Refuses BEFORE any change when <data-dir>/agent is missing.
+    - name: Find the k3s data directory
+      when: not (registry_rollback | bool)
+      block:
+        - name: Read the unit's environment files
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop: "{{ registry_unit_props | regex_findall('(?m)^EnvironmentFiles=(\\S+)') | list }}"
+          register: registry_dd_envfiles
+          failed_when: false
+          check_mode: false
+          no_log: true  # an environment file holds K3S_TOKEN
+
+        - name: The config file of k3s
+          ansible.builtin.set_fact:
+            registry_config_file: >-
+              {{ registry_cfg_cli[-1] if registry_cfg_cli | length > 0 else
+              (registry_cfg_env[-1] if registry_cfg_env | length > 0 else registry_config_yaml) }}
+          vars:
+            registry_env_texts: >-
+              {{ [registry_unit_props | regex_search('(?m)^Environment=.*$') | default('', true)] +
+              (registry_dd_envfiles.results | default([]) | map(attribute='content', default='') | map('b64decode') | list) }}
+            registry_cfg_cli: >-
+              {{ registry_unit_props | regex_search('(?m)^ExecStart=.*$') | default('', true)
+              | regex_findall('(?:^|\s)(?:--config|-c)(?:=|\s+)["\']?([^"\'\s;]+)') | list }}
+            registry_cfg_env: >-
+              {{ registry_env_texts | map('regex_findall', '(?:^|[\s=])K3S_CONFIG_FILE=["\']?([^"\'\s]+)') | flatten | list }}
+
+        - name: Read config.yaml
+          ansible.builtin.slurp:
+            src: "{{ registry_config_file }}"
+          register: registry_dd_main
+          failed_when: false
+          check_mode: false
+          no_log: true  # config.yaml may hold the k3s token
+
+        - name: List config.yaml.d
+          ansible.builtin.find:
+            paths: "{{ registry_config_file }}.d"
+            patterns: ['(?i).*\.ya?ml$']
+            use_regex: true
+          register: registry_dd_list
+          failed_when: false
+          check_mode: false
+
+        - name: Read the drop-ins
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          loop: "{{ registry_dd_list.files | default([]) | map(attribute='path') | sort(case_sensitive=true) | list }}"
+          register: registry_dd_drop
+          failed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: The data directory
+          ansible.builtin.set_fact:
+            registry_data_dir_found: >-
+              {{ registry_data_dir if registry_data_dir != '' else
+              (registry_dd_cli[-1] if registry_dd_cli | length > 0 else
+              (registry_dd_cfg[-1] if registry_dd_cfg | length > 0 else
+              (registry_dd_env[-1] if registry_dd_env | length > 0 else registry_default_data_dir))) }}
+          vars:
+            registry_dd_texts: >-
+              {{ ([registry_dd_main.content | default('') | b64decode] +
+              (registry_dd_drop.results | default([]) | map(attribute='content', default='') | map('b64decode') | list)) }}
+            registry_dd_cfg: >-
+              {{ registry_dd_texts | map('regex_findall', '(?m)^data-dir:[ \t]*["\']?([^"\'\s#]+)') | flatten | list }}
+            registry_dd_cli: >-
+              {{ registry_unit_props | regex_search('(?m)^ExecStart=.*$') | default('', true)
+              | regex_findall('(?:^|\s)(?:--data-dir|-d)(?:=|\s+)["\']?([^"\'\s;]+)') | list }}
+            registry_dd_env_inline: >-
+              {{ [registry_unit_props | regex_search('(?m)^Environment=.*$') | default('', true)]
+              | map('regex_findall', '(?:^|[\s=])K3S_DATA_DIR=["\']?([^"\'\s]+)') | flatten | list }}
+            registry_dd_env_files: >-
+              {{ registry_dd_envfiles.results | default([]) | map(attribute='content', default='') | map('b64decode')
+              | map('regex_findall', '(?m)^K3S_DATA_DIR=["\']?([^"\'\s]+)') | flatten | list }}
+            registry_dd_env: "{{ registry_dd_env_inline if registry_dd_env_inline | length > 0 else registry_dd_env_files }}"
+
+        - name: Where containerd's docker.io hosts.toml lives
+          ansible.builtin.set_fact:
+            registry_hosts_toml_file: >-
+              {{ registry_hosts_toml if registry_hosts_toml != '' else
+              registry_data_dir_found ~ '/agent/etc/containerd/certs.d/docker.io/hosts.toml' }}
+
+        - name: Look for the agent directory of the data directory
+          ansible.builtin.stat:
+            path: "{{ registry_data_dir_found }}/agent"
+          register: registry_dd_agent
+          check_mode: false
+
+        - name: Refuse when the k3s data directory has no agent directory
+          ansible.builtin.assert:
+            that:
+              - registry_data_dir_found is match('^/')
+              - registry_dd_agent.stat.isdir | default(false)
+            fail_msg: >-
+              {{ inventory_hostname }}: the k3s data directory {{ registry_data_dir_found }} (from {{
+              'registry_data_dir' if registry_data_dir != '' else 'the data-dir of the unit, config.yaml or config.yaml.d, K3S_DATA_DIR of the unit, else the default' }})
+              has no agent directory, so containerd's hosts.toml cannot be checked there. A custom data-dir that this playbook
+              misreads: pass -e registry_data_dir=<dir>. Nothing was changed.
+            quiet: true
+
+    - name: Look for a registries.yaml
+      ansible.builtin.stat:
+        path: "{{ registry_file }}"
+      register: registry_stat
+
+    - name: Read the current registries.yaml
+      ansible.builtin.slurp:
+        src: "{{ registry_file }}"
+      register: registry_cur_file
+      no_log: true  # it holds the Harbor credential
+      when: registry_stat.stat.exists
+
+    - name: The current file and whether it is ours
+      no_log: true
+      ansible.builtin.set_fact:
+        registry_cur_text: "{{ (registry_cur_file.content | b64decode) if registry_stat.stat.exists else '' }}"
+        registry_cur_ours: "{{ (not registry_stat.stat.exists) or ((((registry_cur_file.content | b64decode).splitlines() | first | default('')) | trim) in registry_markers) }}"
+
+    - name: Refuse a registries.yaml that this playbook did not write (unless -e registry_allow_replace=true)
+      ansible.builtin.assert:
+        that: registry_cur_ours | bool or registry_allow_replace | bool
+        fail_msg: >-
+          {{ inventory_hostname }}: {{ registry_file }} exists and its first line is not one of {{ registry_markers }}: it
+          belongs to the device owner. Nothing was changed. Look at it (it may hold the owner's mirrors or credentials), or
+          pass -e registry_allow_replace=true to replace it (the backup keeps it).
+        quiet: true
+
+    # ------------------------------------------------------------------ rollback
+    - name: Roll back the registry mirror
+      when: registry_rollback | bool
+      block:
+        - name: Find the backups
+          ansible.builtin.find:
+            paths: "{{ registry_backup_dir }}"
+            patterns: ["registries.yaml.bak-*", "registries.yaml.absent-*"]
+          register: registry_baks
+
+        - name: Refuse an unknown registry_rollback_to
+          ansible.builtin.assert:
+            that: registry_rollback_to in ['newest', 'original']
+            fail_msg: "registry_rollback_to must be newest or original, not '{{ registry_rollback_to }}'. Nothing was changed."
+            quiet: true
+
+        - name: Choose the backup
+          ansible.builtin.set_fact:
+            # sort by the timestamp in the name (absent-* sorts before bak-* by name, so the name alone would be wrong)
+            registry_baks_by_time: >-
+              {{ registry_baks.files | map(attribute='path')
+              | map('regex_replace', '^(.*)/registries\.yaml\.(bak|absent)-([^/]*)$', '\3 \1/registries.yaml.\2-\3')
+              | sort | list }}
+
+        - name: Pick the newest or the oldest
+          ansible.builtin.set_fact:
+            registry_restore_from: >-
+              {{ registry_backup if registry_backup != '' else
+              ((registry_baks_by_time | first if registry_rollback_to == 'original' else registry_baks_by_time | last)
+              | default('') | regex_replace('^[^ ]* ', '')) }}
+
+        - name: Refuse without a backup
+          ansible.builtin.assert:
+            that: registry_restore_from != ''
+            fail_msg: "No backup in {{ registry_backup_dir }} and no -e registry_backup=<file>. Nothing was changed."
+            quiet: true
+
+        - name: Plan
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: restore {{ registry_restore_from }}{{
+              ' (the device had no registries.yaml: the file is removed)' if registry_restore_from is search('registries\.yaml\.absent-') else '' }}
+              over {{ registry_file }}
+
+        - name: Read the backup
+          ansible.builtin.slurp:
+            src: "{{ registry_restore_from }}"
+          register: registry_bak_file
+          no_log: true
+          when: registry_restore_from is not search('registries\.yaml\.absent-')
+
+        - name: Keep the file that is being replaced
+          ansible.builtin.copy:
+            src: "{{ registry_file }}"
+            dest: "{{ registry_backup_dir }}/registries.yaml.pre-rollback-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+            remote_src: true
+            mode: "0600"
+          diff: false
+          when: registry_stat.stat.exists and not ansible_check_mode
+
+        - name: Restore the backup
+          ansible.builtin.copy:
+            src: "{{ registry_restore_from }}"
+            dest: "{{ registry_file }}"
+            remote_src: true
+            mode: "0600"
+            owner: "{{ registry_file_owner if registry_file_owner != '' else omit }}"
+            group: "{{ registry_file_owner if registry_file_owner != '' else omit }}"
+          register: registry_restored
+          diff: false
+          when: registry_restore_from is not search('registries\.yaml\.absent-')
+
+        - name: Remove the file (the backup says there was none)
+          ansible.builtin.file:
+            path: "{{ registry_file }}"
+            state: absent
+          register: registry_removed
+          when: registry_restore_from is search('registries\.yaml\.absent-')
+
+        - name: Restart k3s only when the file changed
+          ansible.builtin.command:
+            argv: "{{ registry_systemctl_cmd + ['restart', registry_unit] }}"
+          when: (registry_restored.changed | default(false)) or (registry_removed.changed | default(false))
+
+        - name: Wait for k3s
+          ansible.builtin.include_tasks: tasks/registry-wait.yml
+          when: not ansible_check_mode
+
+    # ------------------------------------------------------------------ roll out
+    - name: Roll out the registry mirror
+      when: not (registry_rollback | bool)
+      block:
+        # -------------------------------------------------------------- 2. credential, on the controller
+        - name: The device's credential from the platform (only its two keys, never printed)
+          delegate_to: localhost
+          become: false
+          ansible.builtin.command:
+            argv: >-
+              {{ registry_local_kubectl_cmd + ['--context', registry_kube_context, '-n', registry_credential_namespace,
+              'get', 'secret', registry_credential_secret, '-o',
+              'jsonpath={.data.' ~ ansible_teknoir_namespace ~ '\.' ~ item ~ '}'] }}
+          loop: [username, password]
+          register: registry_cred_raw
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: The credential, decoded
+          no_log: true
+          ansible.builtin.set_fact:
+            registry_user: "{{ (registry_cred_raw.results[0].stdout | default('')) | b64decode if (registry_cred_raw.results[0].stdout | default('')) != '' else '' }}"
+            registry_pass: "{{ (registry_cred_raw.results[1].stdout | default('')) | b64decode if (registry_cred_raw.results[1].stdout | default('')) != '' else '' }}"
+
+        - name: Refuse without a credential
+          ansible.builtin.assert:
+            that:
+              - registry_user is match(registry_cred_re)
+              - registry_pass is match(registry_cred_re)
+            fail_msg: >-
+              {{ inventory_hostname }}: no usable credential for teamspace {{ ansible_teknoir_namespace }} in Secret
+              {{ registry_credential_namespace }}/{{ registry_credential_secret }} (keys {{ ansible_teknoir_namespace }}.username
+              and {{ ansible_teknoir_namespace }}.password) of context {{ registry_kube_context }}
+              (kubectl exit codes {{ registry_cred_raw.results | map(attribute='rc') | list }}). Is the harbor chart with
+              teamspaceRobots released, and has harbor-config run (hourly)? Nothing was changed.
+            quiet: true
+
+        # -------------------------------------------------------------- 3. probe from the device
+        - name: Harbor answers 401 on /v2/ with a valid TLS chain (from the device)
+          ansible.builtin.command:
+            argv: "{{ registry_curl_cmd + ['-sS', '--max-time', '30', '-o', '/dev/null', '-w', '%{http_code}', 'https://' ~ registry_host ~ '/v2/'] }}"
+          register: registry_probe_v2
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Refuse when Harbor is not reachable from the device
+          ansible.builtin.assert:
+            that:
+              - registry_probe_v2.rc == 0
+              - registry_probe_v2.stdout == '401'
+            fail_msg: >-
+              {{ inventory_hostname }}: https://{{ registry_host }}/v2/ must answer 401 with a valid TLS certificate, from the
+              device. curl exit code {{ registry_probe_v2.rc }} (60 = certificate not trusted, 6 = no DNS, 28 = timeout),
+              HTTP status {{ registry_probe_v2.stdout | default('none') }}. Nothing was changed.
+            quiet: true
+
+        - name: A pull token for the probe image, with the credential (curl config on stdin)
+          ansible.builtin.command:
+            argv: "{{ registry_curl_cmd + ['-sS', '--max-time', '30', '--config', '-', 'https://' ~ registry_host ~ '/service/token?service=harbor-registry&scope=repository:' ~ registry_probe_repo ~ ':pull'] }}"
+            stdin: 'user = "{{ registry_user }}:{{ registry_pass }}"'
+          register: registry_probe_token
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: The token
+          no_log: true
+          ansible.builtin.set_fact:
+            registry_token: >-
+              {{ ((registry_probe_token.stdout | default('{}', true)) | from_json).token | default('') if registry_probe_token.rc == 0 and
+              registry_probe_token.stdout | default('') is search('^\s*\{') else '' }}
+
+        - name: Refuse when Harbor gives no token for the credential
+          ansible.builtin.assert:
+            that: registry_token | length > 0
+            fail_msg: >-
+              {{ inventory_hostname }}: Harbor at {{ registry_host }} gave no token for repository:{{ registry_probe_repo }}:pull
+              with the credential of {{ ansible_teknoir_namespace }} (curl exit code {{ registry_probe_token.rc }}). The robot may not
+              exist yet (harbor-config creates it within the hour) or its secret is stale. Nothing was changed.
+            quiet: true
+
+        - name: HEAD of the probe manifest through Harbor answers 200 (token on stdin)
+          ansible.builtin.command:
+            argv: >-
+              {{ registry_curl_cmd + ['-sS', '--max-time', '60', '-I', '-o', '/dev/null', '-w', '%{http_code}', '--config', '-',
+              '-H', 'Accept: ' ~ registry_accept,
+              'https://' ~ registry_host ~ '/v2/' ~ registry_probe_repo ~ '/manifests/' ~ registry_probe_tag] }}
+            stdin: 'header = "Authorization: Bearer {{ registry_token }}"'
+          register: registry_probe_head
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          no_log: true
+
+        - name: Refuse when Harbor does not serve the probe image
+          ansible.builtin.assert:
+            that:
+              - registry_probe_head.rc == 0
+              - registry_probe_head.stdout == '200'
+            fail_msg: >-
+              {{ inventory_hostname }}: HEAD https://{{ registry_host }}/v2/{{ registry_probe_repo }}/manifests/{{ registry_probe_tag }} answered
+              {{ registry_probe_head.stdout | default('nothing') }} (curl exit code {{ registry_probe_head.rc }}), wanted 200. Harbor is up
+              but does not serve the proxy project (an upstream down? the robot lacks pull?). Nothing was changed.
+            quiet: true
+
+        # -------------------------------------------------------------- 4. render, redacted diff
+        - name: Render the new registries.yaml
+          no_log: true
+          ansible.builtin.set_fact:
+            registry_new_text: "{{ lookup('ansible.builtin.template', 'registries.yaml.j2') }}"
+
+        - name: What changes
+          no_log: true
+          ansible.builtin.set_fact:
+            registry_changed: "{{ registry_cur_text != registry_new_text }}"
+            # A file that is not ours (registry_allow_replace=true) is the owner's: regexes cannot know every place a
+            # credential can sit in it (flow style, anchors, other keys), so its content is never printed.
+            registry_cur_redacted: >-
+              {{ (registry_cur_text | regex_replace(registry_redact_re, registry_redact_to)) if registry_cur_ours | bool else
+              '# (' ~ (registry_cur_text.splitlines() | length) ~ ' lines of a registries.yaml that belongs to the device owner; not shown, the backup keeps it)' }}
+            registry_new_redacted: "{{ registry_new_text | regex_replace(registry_redact_re, registry_redact_to) }}"
+
+        - name: Plan
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }} ({{ registry_unit }}): {{ registry_file }} -> mirrors {{ registry_mirrors.keys() | list | join(', ') }} through
+              {{ registry_host }} as {{ ansible_teknoir_namespace }}'s robot;
+              {{ 'already in place, nothing to change (k3s is not restarted)' if not (registry_changed | bool) else
+              ('only the credential changes' if registry_cur_redacted == registry_new_redacted else
+              ('the file is new' if not registry_stat.stat.exists else 'the file changes')) ~ ', k3s will be restarted (pods keep running)' }}
+
+        # --diff must not print the credential: diff two temporary files that hold the redacted texts. Ansible
+        # shows a diff only for a task that reports a change, so the second copy is that task (it changes the
+        # temporary file only); nothing of this runs when there is nothing to change.
+        - name: Redacted diff of registries.yaml (--diff; the password shows as ********)
+          when: registry_changed | bool
+          block:
+            - name: Temporary file for the redacted diff
+              ansible.builtin.tempfile:
+                state: file
+                prefix: registry-mirror-diff.
+              register: registry_diff_tmp
+              check_mode: false
+
+            - name: Seed it with the redacted current file
+              ansible.builtin.copy:
+                content: "{{ registry_cur_redacted }}"
+                dest: "{{ registry_diff_tmp.path }}"
+                mode: "0600"
+              check_mode: false
+              diff: false
+              no_log: true
+
+            - name: Show the redacted diff
+              ansible.builtin.copy:
+                content: "{{ registry_new_redacted }}"
+                dest: "{{ registry_diff_tmp.path }}"
+                mode: "0600"
+              check_mode: false
+
+          always:
+            - name: Remove the temporary file
+              ansible.builtin.file:
+                path: "{{ registry_diff_tmp.path }}"
+                state: absent
+              check_mode: false
+              when: registry_diff_tmp.path is defined
+
+        # -------------------------------------------------------------- 5. to 8. change (not in --check)
+        - name: Back up, write, restart, check
+          when: (registry_changed | bool) and not ansible_check_mode
+          block:
+            - name: Make the backup directory (outside the k3s directories)
+              ansible.builtin.file:
+                path: "{{ registry_backup_dir }}"
+                state: directory
+                mode: "0700"
+
+            - name: Stamp
+              ansible.builtin.set_fact:
+                registry_stamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+            - name: Back up the current file
+              ansible.builtin.copy:
+                src: "{{ registry_file }}"
+                dest: "{{ registry_backup_dir }}/registries.yaml.bak-{{ registry_stamp }}"
+                remote_src: true
+                mode: "0600"
+              diff: false
+              register: registry_bak
+              when: registry_stat.stat.exists
+
+            - name: Record that there was no file
+              ansible.builtin.copy:
+                content: "{{ inventory_hostname }}: there was no {{ registry_file }} before registry-mirror.yml ran\n"
+                dest: "{{ registry_backup_dir }}/registries.yaml.absent-{{ registry_stamp }}"
+                mode: "0600"
+              register: registry_absent
+              when: not registry_stat.stat.exists
+
+            - name: Write registries.yaml (root, 0600)
+              ansible.builtin.copy:
+                content: "{{ registry_new_text }}"
+                dest: "{{ registry_file }}"
+                mode: "0600"
+                owner: "{{ registry_file_owner if registry_file_owner != '' else omit }}"
+                group: "{{ registry_file_owner if registry_file_owner != '' else omit }}"
+              diff: false
+              no_log: true
+              register: registry_write
+
+            - name: Restart k3s (the file changed; pods keep running with KillMode=process)
+              ansible.builtin.command:
+                argv: "{{ registry_systemctl_cmd + ['restart', registry_unit] }}"
+              when: registry_write.changed
+
+            - name: Wait for k3s
+              ansible.builtin.include_tasks: tasks/registry-wait.yml
+
+            - name: containerd's hosts.toml for docker.io names the Harbor project
+              ansible.builtin.slurp:
+                src: "{{ registry_hosts_toml_file }}"
+              register: registry_hosts
+              # What k3s really writes (verified with rancher/k3s v1.34.5): a host table `[host."https://<host>/v2"]` and
+              # below it a rewrite table `[host."https://<host>/v2".rewrite]` with `"^(.*)$" = "dockerhub/$1"`.
+              until: >-
+                registry_hosts is succeeded and
+                ('[host."https://' ~ registry_host ~ '/v2"]') in (registry_hosts.content | b64decode) and
+                ('[host."https://' ~ registry_host ~ '/v2".rewrite]') in (registry_hosts.content | b64decode) and
+                (registry_hosts.content | b64decode) is search('(?m)^\s*"\^\(\.\*\)\$"\s*=\s*"dockerhub/\$1"\s*$')
+              retries: "{{ (registry_wait_timeout | int / 5) | int }}"
+              delay: 5
+
+            - name: Probe pull of a system image through the mirror
+              ansible.builtin.command:
+                argv: "{{ registry_crictl_cmd + ['pull', registry_probe_pull] }}"
+              changed_when: false
+
+            # The public probe above also passes when containerd never used Harbor: k3s keeps the upstream registry as the
+            # last fallback and containerd moves on after a 401/403/5xx. A PRIVATE image cannot come from the anonymous
+            # upstream, so this pull succeeds only through Harbor with the credential and the rewrite of registries.yaml.
+            # The proof image (~100 MB) must not stay on a small robot just because of the proof: note which images the
+            # device has before the pull and remove the proof image afterwards only when it was not among them (by image
+            # ID, so a tag of an image that was there already, or a running workload's image, is never removed).
+            - name: Image IDs on the device before the proof pull
+              ansible.builtin.command:
+                argv: "{{ registry_crictl_cmd + ['images', '-q'] }}"
+              register: registry_images_before
+              changed_when: false
+              check_mode: false
+
+            - name: Proof pull of a private ghcr.io image (only Harbor can serve it)
+              ansible.builtin.command:
+                argv: "{{ registry_crictl_cmd + ['pull', registry_proof_image] }}"
+              changed_when: false
+              register: registry_proof_pull
+
+            - name: The ID of the proof image
+              ansible.builtin.command:
+                argv: "{{ registry_crictl_cmd + ['images', '-q', registry_proof_image] }}"
+              register: registry_proof_id
+              changed_when: false
+              failed_when: false
+              check_mode: false
+
+            - name: Remove the proof image again when the device did not have it before (a failure here is not fatal)
+              ansible.builtin.command:
+                argv: "{{ registry_crictl_cmd + ['rmi', registry_proof_id.stdout_lines | first] }}"
+              register: registry_proof_rmi
+              changed_when: registry_proof_rmi.rc == 0
+              failed_when: false
+              when:
+                - registry_proof_id.rc == 0
+                - registry_proof_id.stdout_lines | length > 0
+                - (registry_proof_id.stdout_lines | first) not in registry_images_before.stdout_lines
+
+          rescue:
+            - name: Failed, put the previous registries.yaml back
+              ansible.builtin.copy:
+                src: "{{ registry_bak.dest }}"
+                dest: "{{ registry_file }}"
+                remote_src: true
+                mode: "0600"
+                owner: "{{ registry_file_owner if registry_file_owner != '' else omit }}"
+                group: "{{ registry_file_owner if registry_file_owner != '' else omit }}"
+              diff: false
+              when: registry_bak is defined and registry_bak.dest is defined
+
+            - name: Failed, remove the file (there was none)
+              ansible.builtin.file:
+                path: "{{ registry_file }}"
+                state: absent
+              when: registry_absent is defined and registry_absent.dest is defined
+
+            - name: Restart k3s with the previous configuration
+              ansible.builtin.command:
+                argv: "{{ registry_systemctl_cmd + ['restart', registry_unit] }}"
+              failed_when: false
+              when: (registry_bak is defined and registry_bak.dest is defined) or (registry_absent is defined and registry_absent.dest is defined)
+
+            - name: Wait for k3s again
+              ansible.builtin.include_tasks: tasks/registry-wait.yml
+              when: (registry_bak is defined and registry_bak.dest is defined) or (registry_absent is defined and registry_absent.dest is defined)
+
+            - name: Registry mirror failed
+              ansible.builtin.fail:
+                msg: >-
+                  {{ inventory_hostname }}: the registry mirror {{ registry_host }} could not be set up and the previous
+                  {{ registry_file }} was {{ 'restored' if (registry_bak is defined and registry_bak.dest is defined) else
+                  ('removed (there was none)' if (registry_absent is defined and registry_absent.dest is defined) else 'not touched') }}.
+                  k3s was restarted with it. The run stops here (serial 1, max_fail_percentage 0).
+
+    # ------------------------------------------------------------------ report
+    - name: Look at registries.yaml after the run
+      ansible.builtin.slurp:
+        src: "{{ registry_file }}"
+      register: registry_final
+      no_log: true
+      failed_when: false
+
+    - name: Registry mirror after the run (the credential is not shown)
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ registry_file }} {{
+          'is absent' if registry_final.content is not defined else
+          'holds the mirrors ' ~ ((registry_final.content | b64decode) | regex_findall('(?m)^  ([a-z0-9.]+):$') | join(', ')) }}
