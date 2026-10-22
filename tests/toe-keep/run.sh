@@ -17,6 +17,9 @@ cat > "$work/bin/kubectl" <<'S'
 #!/bin/sh
 img=$(awk '/- \/manager/{f=1;next} f&&/image:/{print $2;exit}' "$TOE_MANIFEST")
 case "$*" in
+  *"get nodes"*) for n in ${TOE_NODES-orin}; do echo "node/$n"; done;;
+  *"get deploy"*"nodeSelector"*) grep -q 'node-role.kubernetes.io/control-plane: "true"' "$TOE_MANIFEST" && printf true;;
+  *"get pods"*'}{.spec.nodeName}{'*) for n in ${TOE_POD_NODE-orin}; do echo "$n"; done;;
   *"get deploy"*) printf '%s' "$img";;
   *"rollout status"*) case "$img" in *badroll*) echo "timed out" >&2; exit 1;; esac; echo "deployment successfully rolled out";;
 esac
@@ -34,7 +37,7 @@ export TOE_MANIFEST="$M"
 CANARY="CANARY-PULL-SECRET-$$-xyz"
 # slurp returns the file base64-encoded, so a leak shows as the base64 of the file: its first 60 characters
 B64HEAD=$(printf 'apiVersion: v1\nkind: Secret\nmetadata: {name: pull, namespace: kube-system}\ntype: kubernetes.io/dockerconfigjson\n' | base64 -w0 | cut -c1-60)
-mk() { # image policy
+mk() { # image policy [nosel|nopriority]: the TOE pod is pinned to the server node unless asked otherwise
 cat > "$M" <<EOT
 apiVersion: v1
 kind: Secret
@@ -46,9 +49,12 @@ data:
 kind: Deployment
 metadata:
   name: toe
+  namespace: kube-system
 spec:
   template:
     spec:
+$([ "${3:-}" = nopriority ] || echo "      priorityClassName: high-priority-toe")
+$([ "${3:-}" = nosel ] || [ "${3:-}" = nopriority ] || printf '      nodeSelector:\n        node-role.kubernetes.io/control-plane: "true"')
       containers:
       - args:
         - --health-probe-bind-address=:8081
@@ -61,6 +67,7 @@ spec:
         image: other:1
         imagePullPolicy: Always
 EOT
+sed -i '/^$/d' "$M"
 }
 run() { ( cd "$here" && ansible-playbook -i localhost, -c local --limit localhost play.yml \
   -e ansible_become=false -e toe_manifest="$M" -e toe_backup_dir="$B" \
@@ -88,6 +95,27 @@ ok "script left it: no change, no backup" "echo \"\$o\" | grep -q 'failed=0' && 
 mk "$PINNED" Always; rm -rf "$B"
 o=$(run -e fake_script=keep)
 ok "pinned image with policy Always is set to IfNotPresent" "[ \"\$(img)\" = \"$PINNED\" ] && [ \"\$(pol)\" = IfNotPresent ]"
+
+# 2c. the pinned image is as wanted but the pod spec has no nodeSelector: the pin is put back
+mk "$PINNED" IfNotPresent nosel; rm -rf "$B"
+o=$(run -e fake_script=keep)
+ok "pin: selector added to an otherwise correct manifest (backup made, image untouched)" "echo \"\$o\" | grep -q 'failed=0' && [ \$(grep -c 'control-plane: \"true\"' $M) = 1 ] && [ \"\$(img)\" = \"$PINNED\" ] && [ \$(ls $B | wc -l) = 1 ] && echo \"\$o\" | grep -q 'pod pinned to node orin'"
+mk "$PINNED" IfNotPresent nosel; rm -rf "$B"
+o=$(run -e fake_script=keep -e toe_pin_server=false); ok "pin: toe_pin_server=false leaves the pod spec alone (no change, no backup)" "echo \"\$o\" | grep -q 'failed=0' && [ \$(grep -c 'control-plane' $M) = 0 ] && [ ! -d $B ] && echo \"\$o\" | grep -q '(the script left it)'"
+
+# 2d. the script's manifest lacks the selector: it is put back together with the image
+mk "$PINNED" IfNotPresent; rm -rf "$B"
+o=$(run -e fake_script=rewrite)
+ok "pin: after the script rewrote the manifest the selector is back, directly after priorityClassName" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(awk '/priorityClassName: high-priority-toe/{getline a; print a; exit}' $M)\" = '      nodeSelector:' ] && [ \$(grep -c 'control-plane: \"true\"' $M) = 1 ] && [ \"\$(img)\" = \"$PINNED\" ]"
+mk "$PINNED" IfNotPresent; rm -rf "$B"
+o=$(run -e fake_script=rewrite -e toe_pin_server=false); ok "pin: toe_pin_server=false: only the image is put back" "echo \"\$o\" | grep -q 'failed=0' && [ \$(grep -c 'control-plane' $M) = 0 ] && [ \"\$(img)\" = \"$PINNED\" ]"
+# 2e. the server node cannot be found / the pod spec cannot be understood: refused with the hint, the script's manifest is left
+mk "$PINNED" IfNotPresent; rm -rf "$B"
+o=$(TOE_NODES= run -e fake_script=rewrite); ok "pin: no labelled node: run fails with the hint, the script's manifest is left, no backup" "echo \"\$o\" | grep -q 'failed=1' && echo \"\$o\" | grep -q 'returned 0 node(s)' && [ \"\$(img)\" = \"$TPL\" ] && [ ! -d $B ] && echo \"\$o\" | grep -q 'playbooks/toe-image.yml -e toe_image=$PINNED'"
+mk "$PINNED" IfNotPresent nopriority; rm -rf "$B"
+o=$(run -e fake_script=keep); ok "pin: pod spec not found: run fails with the hint, manifest untouched" "echo \"\$o\" | grep -q 'failed=1' && echo \"\$o\" | grep -q 'expected exactly one TOE pod spec' && [ ! -d $B ] && [ \$(grep -c 'control-plane' $M) = 0 ]"
+mk "$PINNED" IfNotPresent; rm -rf "$B"
+o=$(TOE_POD_NODE=mobile-01-io run -e fake_script=rewrite); ok "pin: pod on another node after the rollout: run fails, the script's manifest restored" "echo \"\$o\" | grep -q 'failed=1' && [ \"\$(img)\" = \"$TPL\" ] && echo \"\$o\" | grep -q 'manifest of the script was restored'"
 
 # 3. a tag without digest is left to the templates
 mk "$TAGONLY" Always; rm -rf "$B"

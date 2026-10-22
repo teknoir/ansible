@@ -41,7 +41,11 @@
 #      changed it, puts it back as toe-image.yml does: `crictl pull` and a digest check first (an
 #      unpullable image never reaches the manifest; the TOE Deployment is Recreate and a watchdog
 #      reboots a device whose TOE is not Ready), then a backup outside the manifests directory, the
-#      image line replaced, imagePullPolicy IfNotPresent, and the rollout. A TOE on a tag without a
+#      image line replaced, imagePullPolicy IfNotPresent, the TOE pod pinned to the k3s server node again
+#      (the templates write the pod spec without the nodeSelector node-role.kubernetes.io/control-plane:
+#      "true"; refused when the pod spec is not found exactly once or the cluster has not exactly one node
+#      with that label; -e toe_pin_server=false skips the pin), and the rollout, which must end with the
+#      TOE pod on that node. A TOE on a tag without a
 #      digest is left to the templates. Prints one line: "TOE image: kept <image> ...", "nothing to
 #      keep", or a WARNING when the manifest was not found at the default path (a custom k3s
 #      data-dir: -e toe_manifest=<data-dir>/server/manifests/teknoir.yaml). The run FAILS, naming

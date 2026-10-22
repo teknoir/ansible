@@ -3,7 +3,8 @@
 # TOE image line (another image, or imagePullPolicy other than IfNotPresent), put it back the way
 # playbooks/toe-image.yml does: pre-pull and digest check first (toe-image-pull.yml, an unpullable image never
 # reaches the manifest), then toe-manifest-set-image.yml (backup outside the manifests directory, image
-# replaced, imagePullPolicy IfNotPresent, wait for the rollout). Prints one status line. Fails the run, with
+# replaced, imagePullPolicy IfNotPresent, TOE pod pinned to the server node, wait for the rollout). The pin is put
+# back too when the script's manifest lacks it (toe_pin_server, toe-pin-check.yml). Prints one status line. Fails the run, with
 # the toe-image.yml command to run, when the image cannot be put back or the manifest cannot be understood
 # any more; the manifest the script wrote is left (or restored after a failed rollout).
 # Needs the vars of playbooks/vars/toe-manifest.yml, toe_wait_timeout and rebootstrap_device.
@@ -29,7 +30,13 @@
         toe_old_policy: "{{ toe_found[0][3] if toe_found | length == 1 else '' }}"
         tn_toe_restore: >-
           {{ tn_toe_keep != '' and toe_found | length == 1
-          and (toe_found[0][1] != tn_toe_keep or toe_found[0][3] != 'IfNotPresent') }}
+          and (toe_found[0][1] != tn_toe_keep or toe_found[0][3] != 'IfNotPresent' or (toe_pin_server | bool and toe_pod_state != 'present')) }}
+
+    # The templates write the TOE pod spec without a nodeSelector: pin it to the server node again (toe-pin-check.yml
+    # refuses when the pod spec cannot be found exactly once or the server node cannot be found).
+    - name: Check that the TOE pod can be pinned to the server node (shared with toe-image.yml)
+      ansible.builtin.import_tasks: toe-pin-check.yml
+      when: tn_toe_restore | bool
 
     - name: Pre-pull the kept image and check its digest (shared with toe-image.yml)
       ansible.builtin.import_tasks: toe-image-pull.yml
@@ -47,7 +54,8 @@
       ansible.builtin.debug:
         msg: >-
           {{ rebootstrap_device }}: TOE image: {{
-          ('kept ' ~ tn_toe_keep ~ (' (put back after the bootstrap script, imagePullPolicy IfNotPresent)'
+          ('kept ' ~ tn_toe_keep ~ (' (put back after the bootstrap script, imagePullPolicy IfNotPresent'
+          ~ (', pod pinned to node ' ~ toe_pin_node if toe_pin_server | bool else '') ~ ')'
           if tn_toe_restore | bool else ' (the script left it)'))
           if tn_toe_keep != '' else
           ('WARNING: TOE manifest not found at ' ~ toe_manifest ~ ': custom k3s data-dir? the TOE image was not kept'

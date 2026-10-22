@@ -1,0 +1,7 @@
+---
+# Decide whether the TOE manifest has to change: toe_edit_needed is true when the image or imagePullPolicy differ
+# from what is wanted, or the pin to the server node is to be added (toe_pin_needed, toe-pin-check.yml; false when
+# toe_pin_server=false). Needs toe_image, toe_old_image, toe_old_policy and toe_pin_needed.
+- name: Does the manifest have to change
+  ansible.builtin.set_fact:
+    toe_edit_needed: "{{ toe_old_image != toe_image or toe_old_policy != 'IfNotPresent' or (toe_pin_needed | default(false) | bool) }}"

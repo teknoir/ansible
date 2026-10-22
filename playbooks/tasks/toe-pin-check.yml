@@ -1,0 +1,56 @@
+---
+# Before the TOE manifest is edited: when toe_pin_server is true, check that the TOE pod can be pinned to the
+# k3s server node. Refuses (nothing is changed) when
+#   - the toe pod spec is not found exactly once in the manifest (toe_pod_count, toe-manifest-read.yml),
+#   - it already has a nodeSelector other than the pin (the playbook does not merge selectors),
+#   - the cluster has no node labelled node-role.kubernetes.io/control-plane=true, or more than one (the TOE reads
+#     the keys of the node it runs on, so there must be exactly one place it can go).
+# Sets toe_pin_node (the node name, without the `node/` prefix) and toe_pin_needed (the selector is to be added or
+# the manifest cannot be understood). Read-only commands only (they run in --check mode too). Needs the vars of
+# playbooks/vars/toe-manifest.yml and toe-manifest-read.yml run before; the caller sets become.
+- name: Refuse a manifest where the toe pod spec is not found exactly once
+  ansible.builtin.assert:
+    that: toe_pod_count | int == 1
+    fail_msg: >-
+      {{ toe_manifest }}: expected exactly one TOE pod spec (Deployment kube-system/toe with `priorityClassName:
+      high-priority-toe` and the toe container), found {{ toe_pod_count }}. Nothing was changed. To leave the pod
+      template alone pass -e toe_pin_server=false.
+    quiet: true
+  when: toe_pin_server | bool
+
+- name: Refuse a TOE pod spec with another nodeSelector
+  ansible.builtin.assert:
+    that: toe_pod_state in ['absent', 'present']
+    fail_msg: >-
+      {{ toe_manifest }}: the TOE pod spec has a nodeSelector that is not `{{ toe_pin_line }}` alone
+      (or one that is not directly under `priorityClassName: high-priority-toe`). It is not merged. Nothing was
+      changed. Fix it by hand or pass -e toe_pin_server=false.
+    quiet: true
+  when: toe_pin_server | bool
+
+- name: Which node carries the control-plane label
+  ansible.builtin.command:
+    argv: "{{ toe_kubectl_cmd + toe_pin_get_nodes_argv }}"
+  register: toe_pin_nodes
+  until: toe_pin_nodes.rc == 0  # right after a k3s restart the API server may not answer yet
+  retries: 12
+  delay: 5
+  changed_when: false
+  check_mode: false
+  when: toe_pin_server | bool
+
+- name: Exactly one node carries the control-plane label
+  ansible.builtin.assert:
+    that: toe_pin_nodes.stdout_lines | length == 1
+    fail_msg: >-
+      {{ inventory_hostname }}: `kubectl get nodes -l {{ toe_pin_label }}` returned
+      {{ toe_pin_nodes.stdout_lines | length }} node(s) ({{ toe_pin_nodes.stdout_lines | join(', ') }}), expected exactly one:
+      the server node the TOE has to run on (it holds the device keys in /etc/teknoir). Nothing was changed.
+      Pass -e toe_pin_server=false to leave the pod template alone.
+    quiet: true
+  when: toe_pin_server | bool
+
+- name: The node the TOE is pinned to
+  ansible.builtin.set_fact:
+    toe_pin_node: "{{ toe_pin_nodes.stdout_lines[0] | regex_replace('^node/', '') if toe_pin_server | bool else '' }}"
+    toe_pin_needed: "{{ (toe_pin_server | bool) and toe_pod_state != 'present' }}"

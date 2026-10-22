@@ -2,7 +2,10 @@
 # Read the TOE manifest and find the toe container in it (the image line after `command: - /manager`).
 # Sets toe_found: a list with one [prefix, image, middle, policy] entry per toe container (exactly one on a
 # Teknoir device), and toe_manifest_present. With toe_read_optional=true a missing manifest gives an empty
-# list instead of a failure. Needs toe_manifest and toe_re (playbooks/vars/toe-manifest.yml); the caller sets
+# list instead of a failure. Also sets toe_pod_count and toe_pod_state: how many documents are the toe Deployment's pod spec
+# (Deployment kube-system/toe with the priorityClassName line and the toe container: exactly one on a Teknoir device)
+# and the state of its nodeSelector: absent, present (the pin to the server node), conflict (another nodeSelector), none
+# (the pod spec was not found exactly once). Needs toe_manifest and toe_re (playbooks/vars/toe-manifest.yml); the caller sets
 # become.
 #
 # The manifest holds Secrets (the image pull secrets), so the slurp has no_log and nothing but the regex
@@ -30,3 +33,24 @@
   ansible.builtin.set_fact:
     toe_manifest_present: "{{ toe_manifest_stat.stat.exists }}"
     toe_found: "{{ ((toe_file.content | default('') | b64decode) | regex_findall(toe_re, multiline=True)) if toe_manifest_stat.stat.exists else [] }}"
+
+- name: Find the toe pod spec and its nodeSelector
+  ansible.builtin.set_fact:
+    toe_pod_json: >-
+      {%- set docs = (toe_file.content | default('') | b64decode).split('\n---')
+          | select('search', toe_pod_priority_re) | select('search', toe_pod_container_re)
+          | select('search', '(?m)^kind: Deployment$') | select('search', '(?m)^  name: toe$')
+          | select('search', '(?m)^  namespace: kube-system$') | list -%}
+      {%- set doc = docs[0] if docs | length == 1 else '' -%}
+      {%- set sel = doc | regex_findall(toe_pod_selector_re) -%}
+      {%- set pinned = sel | length == 1 and (toe_pin_line in (sel[0][1].split('\n') | map('trim') | list)) -%}
+      {%- set nsel = doc | regex_findall(toe_pod_selector_any_re) | length -%}
+      {%- set state = 'none' if docs | length != 1 else ('absent' if nsel == 0 else ('present' if pinned and nsel == 1 else 'conflict')) -%}
+      {{ {'count': docs | length, 'state': state} | to_json }}
+  no_log: true  # derived from the manifest, which holds Secrets; only the count and the state are kept
+  when: toe_manifest_stat.stat.exists
+
+- name: The toe pod spec, count and nodeSelector state
+  ansible.builtin.set_fact:
+    toe_pod_count: "{{ (toe_pod_json | from_json).count if toe_manifest_stat.stat.exists else 0 }}"
+    toe_pod_state: "{{ (toe_pod_json | from_json).state if toe_manifest_stat.stat.exists else 'none' }}"
