@@ -280,8 +280,12 @@ device (`all`, wildcards and patterns that match several are refused unless `-e 
 6. **write** the file (root, `0600`; only when it differs);
 7. **restart k3s only when the file changed**, then wait: on a server the node and the TOE are Ready, on an agent
    the unit is active and containerd reports the runtime ready (an agent has no apiserver to ask);
-8. **checks**: containerd's `docker.io` `hosts.toml` names `https://<host>/v2/dockerhub`, and `k3s crictl pull
-   docker.io/rancher/mirrored-pause:3.6` works;
+8. **checks**: containerd's `docker.io` `hosts.toml` has the host `https://<host>/v2` with the rewrite
+   `^(.*)$` -> `dockerhub/$1` (the format k3s really writes), `k3s crictl pull docker.io/rancher/mirrored-pause:3.6`
+   works, and then a pull of a small **private** image (`registry_proof_image`, default
+   `ghcr.io/teknoir/observatory-event-processing-app:latest`, ~100 MB, amd64 and arm64). The public probe also passes
+   through the upstream fallback; the private image is refused there (403), so its pull proves that containerd used
+   Harbor with the credential and the rewrite;
 9. **on any failure after step 6**: restores the backup (or removes the file), restarts k3s, waits, then fails.
 
 `-e registry_rollback=true` restores the newest backup (the file it replaces is kept as `registries.yaml.pre-rollback-<UTC>`),
@@ -290,7 +294,7 @@ backup, no restart). The credential is never printed: not in the plan, the diff,
 
 Variables: `registry_kube_context` (required unless rolling back), `registry_host` (default
 `harbor.<ansible_teknoir_domain>`), `registry_rollback`, `registry_backup`, `registry_allow_replace`,
-`registry_allow_many`, `registry_wait_timeout` (300), `registry_node_name` (default: `node-name` of
+`registry_allow_many`, `registry_proof_image`, `registry_wait_timeout` (300), `registry_node_name` (default: `node-name` of
 `/etc/rancher/k3s/config.yaml`, else the host name); the paths and commands (`registry_file`, `registry_file_owner`,
 `registry_backup_dir`, `registry_hosts_toml`, `registry_config_yaml`, `registry_*_cmd`, `registry_use_become`) default to a
 Teknoir device.

@@ -21,8 +21,10 @@
 #   6. writes the file (root, 0600),
 #   7. restarts k3s ONLY when the file changed, then waits: on a server the node and the TOE are Ready, on an agent the
 #      unit is active and containerd reports runtime and network ready,
-#   8. checks that containerd's docker.io hosts.toml names https://<host>/v2/dockerhub, and pulls rancher/mirrored-pause
-#      with `k3s crictl pull`,
+#   8. checks that containerd's docker.io hosts.toml has the host `https://<host>/v2` with the rewrite `^(.*)$` ->
+#      `dockerhub/$1`, pulls rancher/mirrored-pause with `k3s crictl pull`, and then pulls a small PRIVATE ghcr.io image
+#      (registry_proof_image): the anonymous upstream fallback cannot serve it, so the pull proves that containerd
+#      really went through Harbor with the credential (the public probe alone passes via the fallback too),
 #   9. on any failure after step 6: restores the backup (or removes the file), restarts k3s, waits, then fails.
 #
 #   tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_kube_context=vpro
@@ -41,6 +43,8 @@
 #   registry_backup        with registry_rollback: the backup file to restore (default: the newest in registry_backup_dir).
 #   registry_allow_replace default false. Replace a registries.yaml that this playbook did not write.
 #   registry_allow_many    default false. Allow --limit all / a wildcard / a pattern that matches more than one device.
+#   registry_proof_image   a small private multi-arch ghcr.io/teknoir image that the proof pull fetches (default
+#                          ghcr.io/teknoir/observatory-event-processing-app:latest, ~100 MB). Must not be public.
 #   registry_wait_timeout  seconds to wait for k3s after a restart, default 300.
 #   registry_node_name     the node's name on a server, default: node-name of /etc/rancher/k3s/config.yaml, else the host name.
 #   registry_file, registry_file_owner, registry_backup_dir, registry_hosts_toml, registry_config_yaml, registry_*_cmd,
@@ -97,6 +101,10 @@
     registry_probe_repo: dockerhub/rancher/mirrored-pause
     registry_probe_tag: "3.6"
     registry_probe_pull: docker.io/rancher/mirrored-pause:3.6
+    # The mirror proof: a small PRIVATE multi-arch (amd64, arm64) ghcr.io/teknoir image, ~100 MB. The anonymous upstream
+    # fallback answers 403 for it, so only Harbor (ghcr project, with the robot credential) can serve it. Override with
+    # -e registry_proof_image=<another private ghcr.io/teknoir image> if this one is gone. Never a public image.
+    registry_proof_image: ghcr.io/teknoir/observatory-event-processing-app:latest
     registry_host_re: '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$'
     # What a credential may contain: it goes into a YAML file and a curl config. A Harbor robot is robot$name.
     registry_cred_re: '^[A-Za-z0-9$_.~+=@%:/-]+$'
@@ -512,7 +520,13 @@
               ansible.builtin.slurp:
                 src: "{{ registry_hosts_toml }}"
               register: registry_hosts
-              until: registry_hosts is succeeded and ('https://' ~ registry_host ~ '/v2/dockerhub') in (registry_hosts.content | b64decode)
+              # What k3s really writes (verified with rancher/k3s v1.34.5): a host table `[host."https://<host>/v2"]` and
+              # below it a rewrite table `[host."https://<host>/v2".rewrite]` with `"^(.*)$" = "dockerhub/$1"`.
+              until: >-
+                registry_hosts is succeeded and
+                ('[host."https://' ~ registry_host ~ '/v2"]') in (registry_hosts.content | b64decode) and
+                ('[host."https://' ~ registry_host ~ '/v2".rewrite]') in (registry_hosts.content | b64decode) and
+                (registry_hosts.content | b64decode) is search('(?m)^\s*"\^\(\.\*\)\$"\s*=\s*"dockerhub/\$1"\s*$')
               retries: "{{ (registry_wait_timeout | int / 5) | int }}"
               delay: 5
 
@@ -520,6 +534,15 @@
               ansible.builtin.command:
                 argv: "{{ registry_crictl_cmd + ['pull', registry_probe_pull] }}"
               changed_when: false
+
+            # The public probe above also passes when containerd never used Harbor: k3s keeps the upstream registry as the
+            # last fallback and containerd moves on after a 401/403/5xx. A PRIVATE image cannot come from the anonymous
+            # upstream, so this pull succeeds only through Harbor with the credential and the rewrite of registries.yaml.
+            - name: Proof pull of a private ghcr.io image (only Harbor can serve it)
+              ansible.builtin.command:
+                argv: "{{ registry_crictl_cmd + ['pull', registry_proof_image] }}"
+              changed_when: false
+              register: registry_proof_pull
 
           rescue:
             - name: Failed, put the previous registries.yaml back
