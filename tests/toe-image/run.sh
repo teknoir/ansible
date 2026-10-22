@@ -45,13 +45,23 @@ case "$*" in
     esac
     exit 0;;
   *"get toes.teknoir.org"*) if [ -f "$TOE_CR" ]; then cat "$TOE_CR"; else echo 'Error from server (NotFound): toes.teknoir.org "toe-config" not found' >&2; exit 1; fi;;
+  *"get nodes"*) for n in ${TOE_NODES-orin}; do echo "node/$n"; done;;
+  *"get deploy"*"nodeSelector"*) grep -q 'node-role.kubernetes.io/control-plane: "true"' "$TOE_MANIFEST" && printf true;;
+  *"get pods"*'}{.spec.nodeName}{'*)
+    # one `<node>|<deletionTimestamp>` line per pod. Failed pods (TOE_POD_FAILED_NODE) are listed unless the call
+    # filters them out with the field selector, like the apiserver; terminating pods (TOE_POD_TERM_NODE) always are.
+    for n in ${TOE_POD_NODE-orin}; do echo "$n|"; done
+    case "$*" in *'status.phase!=Failed'*) ;; *) for n in ${TOE_POD_FAILED_NODE-}; do echo "$n|"; done;; esac
+    for n in ${TOE_POD_TERM_NODE-}; do echo "$n|2026-10-22T10:00:00Z"; done;;
   *"get deploy"*) printf '%s' "$img";;
   *"rollout status"*) case "$img" in *badroll*) echo "timed out" >&2; exit 1;; esac; echo "deployment successfully rolled out";;
-  *"get pods"*) echo "toe-0 $img sha256:cfg restarts=0";;
+  *"get pods"*) echo "toe-0 node=${TOE_POD_NODE-orin} $img sha256:cfg restarts=0";;
 esac
 S
 chmod +x "$work/bin/"*
 CANARY="CANARY-PULL-SECRET-$$-xyz"
+# mkm [nopriority|nodeselector|otherselector|dup]: the fake manifest, like the one the bootstrap templates render
+mkm() {
 cat > "$M" <<EOT
 apiVersion: v1
 kind: Namespace
@@ -67,11 +77,29 @@ data:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: other
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      priorityClassName: high-priority-other
+      nodeSelector:
+        foo: bar
+      containers:
+      - name: other
+        image: other:2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: toe
   namespace: kube-system
 spec:
   template:
     spec:
+$([ "${1:-}" = nopriority ] || echo "      priorityClassName: high-priority-toe")
+$([ "${1:-}" = nodeselector ] && printf '      nodeSelector:\n        node-role.kubernetes.io/control-plane: "true"')
+$([ "${1:-}" = otherselector ] && printf '      nodeSelector:\n        disk: ssd')
       containers:
       - args:
         - --health-probe-bind-address=:8081
@@ -84,6 +112,27 @@ spec:
         image: other:1
         imagePullPolicy: Always
 EOT
+if [ "${1:-}" = dup ]; then cat >> "$M" <<EOT
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toe
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      priorityClassName: high-priority-toe
+      containers:
+      - command:
+        - /manager
+        args: [--x]
+        name: toe
+EOT
+fi
+sed -i '/^$/d' "$M"
+}
+mkm
 export TOE_MANIFEST="$M" TOE_CR="$work/toe-config.json" TOE_DIFF_LOG="$work/diff.log"
 run() { ( cd "$repo" && ansible-playbook -i localhost, -c local --limit localhost playbooks/toe-image.yml \
   -e toe_use_become=false -e toe_manifest="$M" -e toe_backup_dir="$B" -e toe_wait_timeout=10 \
@@ -101,6 +150,10 @@ o=$(run --check --diff -e toe_image="$GOOD"); [ -n "${SHOW:-}" ] && echo "$o"; o
 ok "check mode shows the image before and after (the plan, not a file diff)" "echo \"\$o\" | grep -qF -- '-> $GOOD (IfNotPresent)' && echo \"\$o\" | grep -qF '$OLD (Always)'"
 o=$(run -e toe_image="$NOPULL"); ok "unpullable image: run fails, manifest untouched" "! echo \"\$o\" | grep -q 'failed=0' && cmp -s $M $work/before && [ ! -d $B ]"
 o=$(run -e toe_image="$GOOD"); ok "rollout succeeds" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ] && [ \"\$(pol)\" = IfNotPresent ]"
+sel() { awk '/^      priorityClassName: high-priority-toe$/{getline a;getline b; print a "|" b; exit}' "$M"; }
+ok "pin: nodeSelector sits directly under the pod spec, after priorityClassName" "[ \"\$(sel)\" = '      nodeSelector:|        node-role.kubernetes.io/control-plane: \"true\"' ]"
+ok "pin: exactly one selector line added; the other Deployment's nodeSelector is untouched" "[ \$(grep -c 'node-role.kubernetes.io/control-plane' $M) = 1 ] && [ \$(grep -c 'nodeSelector:' $M) = 2 ] && grep -q 'foo: bar' $M"
+ok "pin: output names the node the TOE runs on" "echo \"\$o\" | grep -q 'the TOE runs on node orin' && echo \"\$o\" | grep -q 'node=orin'"
 ok "only the toe container changed (sidecar untouched)" "grep -q 'image: other:1' $M && [ \$(grep -c 'imagePullPolicy: Always' $M) = 1 ]"
 ok "one backup exists, outside the manifests dir" "[ \$(ls $B | wc -l) = 1 ] && [ \$(ls $work/manifests | wc -l) = 1 ]"
 ok "output prints the imageID" "echo \"\$o\" | grep -q 'sha256:cfg'"
@@ -224,6 +277,89 @@ ok "namespaced item without a namespace is sent to default" "grep '\"name\": \"n
 ok "status is not sent" "! grep -q '\"status\"' $TOE_DIFF_LOG"
 ok "cluster-scoped item is sent without a namespace" "! grep '\"name\": \"cr\"' $TOE_DIFF_LOG | grep -q namespace"
 rm -f "$TOE_CR"
+
+# ---- pin the TOE pod to the k3s server node (nodeSelector node-role.kubernetes.io/control-plane: "true")
+export TOE_NODES=orin TOE_POD_NODE=orin
+rm -rf "$B"; mkm
+nsel() { grep -c 'node-role.kubernetes.io/control-plane: "true"' "$M"; }
+cp "$M" "$work/before"
+o=$(run --check --diff -vvv -e toe_image="$GOOD"); ok "pin: check mode edits nothing and plans the pin" "cmp -s $M $work/before && [ ! -d $B ] && echo \"\$o\" | grep -q 'nodeSelector node-role.kubernetes.io/control-plane: .*to be added' && echo \"\$o\" | grep -q 'the TOE runs on node orin'"
+ok "pin: check mode with --diff -vvv never prints the manifest Secret" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+o=$(run -vvv --diff -e toe_image="$GOOD"); ok "pin: fresh manifest gets image, policy and selector in one run" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ] && [ \"\$(pol)\" = IfNotPresent ] && [ \"\$(nsel)\" = 1 ] && [ \"\$(sel)\" != '' ]"
+ok "pin: backup holds the manifest as it was (no selector)" "[ \$(ls $B | wc -l) = 1 ] && [ \$(grep -c 'node-role.kubernetes.io/control-plane' $B/*) = 0 ]"
+ok "pin: canary Secret never printed (plain or base64, --diff -vvv)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+n=$(ls "$B" | wc -l); cp "$M" "$work/before"
+o=$(run -e toe_image="$GOOD"); ok "pin: idempotent re-run (changed=0, no backup, file identical)" "echo \"\$o\" | grep -q 'changed=0' && echo \"\$o\" | grep -q 'nothing to change' && cmp -s $M $work/before && [ \$(ls $B | wc -l) = $n ]"
+# the image the device already has, but no selector: the run still adds it and rolls
+sleep 1
+sed -i '/nodeSelector:$/{N;/control-plane/d}' "$M"
+ok "pin: (setup) selector removed, image is GOOD" "[ \"\$(nsel)\" = 0 ] && [ \"\$(img)\" = \"$GOOD\" ] && grep -q 'foo: bar' $M"
+cp "$M" "$work/before"; n=$(ls "$B" | wc -l)
+o=$(run --check -e toe_image="$GOOD"); ok "pin: unchanged image, check mode: plans the pin, changes nothing" "echo \"\$o\" | grep -q 'to be added' && ! echo \"\$o\" | grep -q 'nothing to change' && cmp -s $M $work/before"
+o=$(run --diff -vvv -e toe_image="$GOOD"); ok "pin: unchanged image still adds the selector (new backup, rollout, pod on the node)" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(nsel)\" = 1 ] && [ \"\$(img)\" = \"$GOOD\" ] && [ \$(ls $B | wc -l) = \$(( $n + 1 )) ] && echo \"\$o\" | grep -q 'The TOE pod runs on the server node'"
+ok "pin: unchanged image run never prints the manifest Secret" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+# the pre-flight checks stay meaningful for a pin-only run: pending prune is refused, a no-op run is not
+sleep 1
+sed -i '/nodeSelector:$/{N;/control-plane/d}' "$M"; cp "$M" "$work/before"
+cat > "$TOE_CR" <<'J'
+{"spec":{"config":{"items":[]}},
+ "status":{"last_applied_config":{"items":[
+  {"apiVersion":"helm.cattle.io/v1","kind":"HelmChart","metadata":{"name":"gone","namespace":"kube-system"}}]}}}
+J
+n=$(ls "$B" | wc -l)
+o=$(run -e toe_image="$GOOD"); ok "pin: unchanged image, pending prune: the pin-only run is refused like any roll" "echo \"\$o\" | grep -q 'HelmChart kube-system/gone' && echo \"\$o\" | grep -q 'would delete 1' && cmp -s $M $work/before && [ \$(ls $B | wc -l) = $n ]"
+sleep 1
+o=$(run -e toe_image="$GOOD" -e toe_allow_prune=true); ok "pin: unchanged image, pending prune, toe_allow_prune=true: pins" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(nsel)\" = 1 ]"
+o=$(run -e toe_image="$GOOD"); ok "pin: now a no-op run is not refused by the pending prune" "echo \"\$o\" | grep -q 'failed=0' && echo \"\$o\" | grep -q 'changed=0'"
+rm -f "$TOE_CR"
+
+# selector already there (e.g. a template that has it): no pin edit, image still rolls, selector not duplicated
+sleep 1; rm -rf "$B"; mkm nodeselector
+o=$(run -e toe_image="$GOOD"); ok "pin: existing identical selector: image rolls, selector not duplicated" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ] && [ \"\$(nsel)\" = 1 ] && echo \"\$o\" | grep -q 'already there'"
+# the pod spec cannot be found exactly once: refused, nothing changed
+rm -rf "$B"; mkm nopriority; cp "$M" "$work/before"
+o=$(run -e toe_image="$GOOD"); ok "pin: no priorityClassName line (pod spec not found): refused, nothing changed" "echo \"\$o\" | grep -q 'expected exactly one TOE pod spec' && echo \"\$o\" | grep -q 'found 0' && cmp -s $M $work/before && [ ! -d $B ]"
+o=$(run --check -e toe_image="$GOOD"); ok "pin: pod spec not found, check mode: same refusal" "echo \"\$o\" | grep -q 'expected exactly one TOE pod spec' && cmp -s $M $work/before"
+mkm dup; cp "$M" "$work/before"
+o=$(run -e toe_image="$GOOD"); ok "pin: pod spec found twice: refused, nothing changed" "echo \"\$o\" | grep -q 'expected exactly one TOE pod spec' && echo \"\$o\" | grep -q 'found 2' && cmp -s $M $work/before && [ ! -d $B ]"
+mkm otherselector; cp "$M" "$work/before"
+o=$(run -e toe_image="$GOOD"); ok "pin: another nodeSelector on the toe pod: refused, not merged" "echo \"\$o\" | grep -q 'is not merged' && cmp -s $M $work/before && [ ! -d $B ]"
+o=$(run -vvv -e toe_image="$GOOD"); ok "pin: refusals never print the manifest Secret (-vvv)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+mkm nopriority; cp "$M" "$work/before"
+o=$(run -e toe_image="$GOOD" -e toe_pin_server=false); ok "pin: toe_pin_server=false: rolls the image, no selector, pod spec need not be found" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ] && [ \"\$(nsel)\" = 0 ] && echo \"\$o\" | grep -q 'toe_pin_server=false'"
+# the server node cannot be found: refused before anything is changed
+mkm; cp "$M" "$work/before"; rm -rf "$B"
+o=$(TOE_NODES= run -e toe_image="$GOOD"); ok "pin: no node with the control-plane label: refused, nothing changed" "echo \"\$o\" | grep -q 'returned 0 node(s)' && echo \"\$o\" | grep -q 'expected exactly one' && cmp -s $M $work/before && [ ! -d $B ]"
+o=$(TOE_NODES="orin pi" run -e toe_image="$GOOD"); ok "pin: two nodes with the label: refused, nothing changed" "echo \"\$o\" | grep -q 'returned 2 node(s)' && cmp -s $M $work/before && [ ! -d $B ]"
+o=$(TOE_NODES= run --check -e toe_image="$GOOD"); ok "pin: no labelled node, check mode: same refusal" "echo \"\$o\" | grep -q 'returned 0 node(s)' && cmp -s $M $work/before"
+o=$(TOE_NODES= run -e toe_image="$GOOD" -e toe_pin_server=false); ok "pin: no labelled node but toe_pin_server=false: rolls" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ]"
+# the TOE pod ends up on another node: the run fails and the manifest is restored
+mkm; rm -rf "$B"; cp "$M" "$work/before"
+o=$(TOE_POD_NODE=mobile-01-io run -e toe_image="$GOOD"); ok "pin: TOE pod on another node after the rollout: run fails, manifest restored" "echo \"\$o\" | grep -q 'failed=1' && cmp -s $M $work/before && echo \"\$o\" | grep -q 'restored'"
+# a Failed pod (Evicted, NodeAffinity ...) or a terminating pod of the old ReplicaSet left on another node is not a TOE pod
+mkm; rm -rf "$B"
+o=$(TOE_POD_FAILED_NODE=mobile-01-io TOE_POD_TERM_NODE="mobile-01-io other" run -e toe_image="$GOOD"); ok "pin: leftover Failed and terminating pods on other nodes are ignored: the run succeeds" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$GOOD\" ] && [ \"\$(nsel)\" = 1 ]"
+# ... but a live (Running or Pending) pod on another node still fails the run and restores the manifest
+mkm; rm -rf "$B"; cp "$M" "$work/before"
+o=$(TOE_POD_NODE="orin mobile-01-io" run -e toe_image="$GOOD"); ok "pin: a live pod on another node next to the right one: run fails, manifest restored" "echo \"\$o\" | grep -q 'failed=1' && cmp -s $M $work/before"
+# rollback of a pre-pin backup pins the pod again (a multi-node robot must not get the bug back)
+mkm; rm -rf "$B"; cp "$M" "$work/orig"; run -e toe_image="$GOOD" > /dev/null; sleep 1; cp "$M" "$work/pinned"
+o=$(TOE_NODES="orin pi" run -e toe_rollback=true); ok "pin: rollback with two labelled nodes is refused before anything is changed" "echo \"\$o\" | grep -q 'returned 2 node(s)' && cmp -s $M $work/pinned && ! ls $B | grep -q pre-rollback"
+o=$(run -e toe_rollback=true -e toe_pin_server=false); ok "pin: rollback with toe_pin_server=false restores the backup as it is (no selector)" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(nsel)\" = 0 ] && [ \"\$(img)\" = \"$OLD\" ] && cmp -s $M $work/orig"
+sleep 1
+o=$(TOE_POD_FAILED_NODE=mobile-01-io TOE_POD_TERM_NODE=mobile-01-io run -vvv --diff -e toe_rollback=true); ok "pin: rollback restores the backup and pins the pod again (leftover Failed/terminating pods ignored)" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(nsel)\" = 1 ] && [ \"\$(img)\" = \"$OLD\" ] && [ \"\$(sel)\" = '      nodeSelector:|        node-role.kubernetes.io/control-plane: \"true\"' ] && echo \"\$o\" | grep -q 'to be added after the restore' && echo \"\$o\" | grep -q 'The TOE pod runs on the server node'"
+ok "pin: rollback never prints the manifest Secret (--diff -vvv)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+ok "pin: rollback result is the backup plus the one selector line" "[ \$(diff $work/orig $M | grep -c '^[<>]') = 2 ]"
+sleep 1
+o=$(run -e toe_rollback=true -e toe_backup="$work/pinned" ); ok "pin: rollback to a backup that already has the selector does not duplicate it" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(nsel)\" = 1 ] && [ \"\$(img)\" = \"$GOOD\" ] && echo \"\$o\" | grep -q 'already in the backup'"
+sleep 1
+o=$(TOE_POD_NODE=mobile-01-io run -e toe_rollback=true -e toe_backup="$work/orig"); ok "pin: rollback leaves the TOE pod on another node: run fails" "echo \"\$o\" | grep -q 'failed=1'"
+# the manifest the cli bootstrap template writes (nodeSelector directly after priorityClassName): recognised as pinned, not changed
+rm -rf "$B"; cp "$here/cli-server.teknoir.yaml" "$M"; cp "$M" "$work/before"
+o=$(run -vvv -e toe_image="$GOOD"); ok "pin: the cli template's manifest has the pin: state present, the selector is not added or duplicated" "echo \"\$o\" | grep -q 'failed=0' && echo \"\$o\" | grep -q 'already there' && [ \"\$(nsel)\" = 1 ] && [ \"\$(img)\" = \"$GOOD\" ] && ! diff $work/before $M | grep -q 'nodeSelector\\|control-plane' && [ \$(diff $work/before $M | grep -c '^[<>]') = 4 ]"
+ok "pin: the cli template's manifest Secret placeholder is not printed (-vvv)" "! echo \"\$o\" | grep -q 'CLI-GOLDEN-PULL-SECRET'"
+o=$(run --check -e toe_image="$GOOD"); ok "pin: the cli template's manifest, check mode: reported as already there, nothing changed" "echo \"\$o\" | grep -q 'already there' && ! echo \"\$o\" | grep -q 'to be added' && [ \"\$(nsel)\" = 1 ]"
+unset TOE_NODES TOE_POD_NODE
 
 printf 'foo: bar\n' > "$work/manifests/teknoir.yaml"
 o=$(run -e toe_image="$GOOD"); ok "manifest without the toe container is refused" "echo \"\$o\" | grep -q 'found 0'"

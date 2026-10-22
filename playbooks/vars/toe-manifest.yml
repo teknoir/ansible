@@ -14,3 +14,31 @@ toe_re: '([ ]+command:\n[ ]+- /manager\n[ ]+image: )(\S+)(\n[ ]+imagePullPolicy:
 toe_wait_argv: "{{ ['-n', toe_namespace, 'rollout', 'status', 'deploy/' ~ toe_deployment, '--timeout=' ~ toe_wait_timeout ~ 's'] }}"
 toe_get_image_argv: "{{ ['-n', toe_namespace, 'get', 'deploy', toe_deployment, '-o', 'jsonpath=' ~ toe_jsonpath_image] }}"
 toe_jsonpath_image: '{.spec.template.spec.containers[?(@.name=="toe")].image}'
+
+# Pin the TOE pod to the k3s server node. TOE mounts hostPath /etc/teknoir (the device keys) and signs its MQTT JWT
+# with rsa_private.pem from it, so on an agent node of the robot (another computer, other keys) EMQX refuses it.
+# toe_pin_server=false leaves the pod template as it is. The selector goes directly under the pod spec, on the line
+# after `priorityClassName: high-priority-toe`; k3s labels the server node with node-role.kubernetes.io/control-plane.
+toe_pin_server: true
+toe_pin_key: node-role.kubernetes.io/control-plane
+toe_pin_line: 'node-role.kubernetes.io/control-plane: "true"'
+toe_pin_label: node-role.kubernetes.io/control-plane=true
+toe_pin_get_nodes_argv: "{{ ['get', 'nodes', '-l', toe_pin_label, '-o', 'name'] }}"
+# the toe pod spec = the one document that is Deployment kube-system/toe and holds the priorityClassName line and the toe container
+toe_pod_priority_re: '(?m)^[ ]+priorityClassName: high-priority-toe$'
+toe_pod_container_re: '(?m)^[ ]+- /manager$'
+toe_pod_selector_any_re: '(?m)^[ ]*nodeSelector:'
+# groups: 1 indent, 2 the lines of an existing nodeSelector directly under the priorityClassName line
+toe_pod_selector_re: '(?m)^([ ]+)priorityClassName: high-priority-toe\n\1nodeSelector:\n((?:\1[ ]+\S[^\n]*\n)*)'
+# insert the selector after the priorityClassName line (only in the document that holds the toe container)
+toe_pin_insert_re: '(?m)^([ ]+)(priorityClassName: high-priority-toe\n)(?=(?:(?!\n---)[\s\S])*?[ ]+command:\n[ ]+- /manager\n)'
+toe_pin_insert: '\g<1>\g<2>\g<1>nodeSelector:\n\g<1>  node-role.kubernetes.io/control-plane: "true"\n'
+toe_get_pin_argv: "{{ ['-n', toe_namespace, 'get', 'deploy', toe_deployment, '-o', 'jsonpath=' ~ toe_jsonpath_pin] }}"
+toe_jsonpath_pin: '{.spec.template.spec.nodeSelector.node-role\.kubernetes\.io/control-plane}'
+# Live TOE pods only: the field selector drops Failed and Succeeded pods (Evicted, NodeAffinity,
+# UnexpectedAdmissionError ... left behind by an earlier ReplicaSet), deletionTimestamp is not selectable, so each
+# line is `<node>|<deletionTimestamp>` and a pod that is being deleted (non-empty timestamp) is ignored in toe_live_pod_nodes.
+toe_get_pod_nodes_argv: "{{ ['-n', toe_namespace, 'get', 'pods', '-l', 'app=toe', '--field-selector=status.phase!=Failed,status.phase!=Succeeded', '-o', 'jsonpath=' ~ toe_jsonpath_pod_nodes] }}"
+toe_jsonpath_pod_nodes: '{range .items[*]}{.spec.nodeName}{"|"}{.metadata.deletionTimestamp}{"\n"}{end}'
+# the nodes of the live pods, from the registered toe_pod_nodes (toe-manifest-wait.yml)
+toe_live_pod_nodes: "{{ toe_pod_nodes.stdout_lines | select('match', '^[^|]*[|]$') | map('regex_replace', '[|]$', '') | unique | list }}"

@@ -30,6 +30,14 @@
           diff: false  # the stand-in is not what is tested; the real tasks must pass with --diff
           when: fake_script == 'rewrite'
 
+        - name: The stand-in for the bootstrap script, rewrite also drops the nodeSelector (the templates have none)
+          ansible.builtin.replace:
+            path: "{{ toe_manifest }}"
+            regexp: '(?m)^      nodeSelector:\n        node-role[^\n]*\n'
+            replace: ''
+          diff: false
+          when: fake_script == 'rewrite'
+
         - name: The stand-in for the bootstrap script, delete
           ansible.builtin.file:
             path: "{{ toe_manifest }}"

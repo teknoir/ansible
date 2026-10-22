@@ -1,0 +1,13 @@
+---
+# Put the pin on the TOE manifest: one nodeSelector line after `priorityClassName: high-priority-toe` (only in the
+# document that holds the toe container), when toe_pin_server is true and the pod spec has no nodeSelector yet
+# (toe_pod_state == 'absent', toe-manifest-read.yml; toe-pin-check.yml refuses every other state before this runs).
+# Shared by toe-manifest-set-image.yml (a rollout) and the rollback in toe-image.yml (the restored backup has no pin).
+# Needs the vars of playbooks/vars/toe-manifest.yml; the caller sets become.
+- name: Pin the TOE pod to the server node (one nodeSelector line after priorityClassName)
+  ansible.builtin.replace:
+    path: "{{ toe_manifest }}"
+    regexp: '{{ toe_pin_insert_re }}'
+    replace: '{{ toe_pin_insert }}'
+  diff: false  # the manifest holds Secrets: --diff must not print it
+  when: (toe_pin_server | bool) and toe_pod_state == 'absent'

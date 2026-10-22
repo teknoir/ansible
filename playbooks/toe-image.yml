@@ -10,6 +10,18 @@
 #   - copies the manifest to a backup OUTSIDE the manifests directory (k3s would apply a backup inside it),
 #   - replaces only the `image:` line of the toe container (the one after `command: - /manager`) and sets
 #     `imagePullPolicy: IfNotPresent` on it (the pinned image stays in the containerd cache),
+#   - pins the TOE pod to the robot's k3s server node: adds
+#         nodeSelector:
+#           node-role.kubernetes.io/control-plane: "true"
+#     directly under the pod spec (the line after `priorityClassName: high-priority-toe`), once, idempotently. TOE
+#     mounts hostPath /etc/teknoir (the device keys) and signs its MQTT JWT with rsa_private.pem from it; on an agent
+#     node of the robot (another computer, other keys) EMQX refuses it (reason 135) and TOE restart-loops, the robot
+#     goes offline. Before anything is changed it checks that the pod spec is found exactly once (and has no other
+#     nodeSelector) and that `kubectl get nodes -l node-role.kubernetes.io/control-plane=true` returns exactly one
+#     node; after the rollout it asserts that every live TOE pod (not Failed or Succeeded, not being deleted) runs on that node. This also happens when the image is
+#     the one the device already has (the run then only adds the selector and rolls the Deployment; the pre-flight
+#     checks below apply to such a run, only a run that changes nothing skips them). -e toe_pin_server=false
+#     leaves the pod template alone,
 #   - before anything is changed, lists what the new TOE would delete on its first start: items recorded in
 #     toe-config (status.last_applied_config) that the config (spec.config.items) no longer has. The old TOE
 #     returned on its first create error before pruning, so such items can still be running on the device (a
@@ -23,7 +35,7 @@
 #     The run is refused unless -e toe_allow_changes=true,
 #   - waits for the Deployment to carry the new image and `rollout status` (<= 5 min),
 #   - on failure restores the backup and waits for the old TOE to be Ready again, then fails the run,
-#   - prints the image, the imageID and the restarts of the TOE pod.
+#   - prints the image, the imageID, the node and the restarts of the TOE pod.
 #
 #   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 \
 #     -e toe_image=ghcr.io/teknoir/toe-app:sha-1a2b3c4d@sha256:<64 hex>
@@ -31,7 +43,9 @@
 #   # Only look: prints the plan and the diff of the manifest, changes nothing (no pull, no restart)
 #   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 --check --diff -e toe_image=...
 #
-#   # Roll back: restore the newest backup (or -e toe_backup=<path>), wait for the TOE to be Ready
+#   # Roll back: restore the newest backup (or -e toe_backup=<path>), pin the TOE pod to the server node again (a
+#   # backup made before the pin has no nodeSelector; same pre-flight check as a rollout; -e toe_pin_server=false
+#   # restores the backup as it is), wait for the TOE to be Ready
 #   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 -e toe_rollback=true
 #
 # Variables
@@ -43,6 +57,8 @@
 #   toe_allow_prune    default false. Accept that the new TOE deletes the items listed by the pre-flight check.
 #   toe_allow_changes  default false. Accept that the new TOE creates or changes the items listed by the pre-flight check
 #                      (or applies them with create/merge patch, or fails on them).
+#   toe_pin_server     default true. Pin the TOE pod to the k3s server node (see above). false: do not touch the pod
+#                      template (an existing nodeSelector is never removed).
 #   toe_allow_many     default false. Allow --limit all / a wildcard / a pattern that matches more than one device.
 #   toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_crictl_cmd, toe_use_become:
 #                      where things are; the defaults fit a Teknoir device. They exist so the playbook can be tried
@@ -71,7 +87,7 @@
     toe_use_become: true
     toe_image_re: '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$'
     toe_jsonpath_pods: >-
-      {range .items[*]}{.metadata.name} {.spec.containers[?(@.name=="toe")].image}
+      {range .items[*]}{.metadata.name} node={.spec.nodeName} {.spec.containers[?(@.name=="toe")].image}
       {.status.containerStatuses[?(@.name=="toe")].imageID}
       restarts={.status.containerStatuses[?(@.name=="toe")].restartCount}{"\n"}{end}
   become: "{{ toe_use_become | bool }}"
@@ -128,11 +144,21 @@
     - name: Roll out the TOE image
       when: not (toe_rollback | bool)
       block:
+        # The TOE pod must run on the k3s server node (it reads the device keys in /etc/teknoir). Refuses before
+        # anything is changed when the pod spec cannot be found exactly once or the server node cannot be found.
+        - name: Check that the TOE pod can be pinned to the server node (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-pin-check.yml
+
+        - name: Does the manifest have to change
+          ansible.builtin.import_tasks: tasks/toe-manifest-plan.yml
+
         - name: Plan
           ansible.builtin.debug:
             msg: >-
               {{ inventory_hostname }}: {{ toe_old_image }} ({{ toe_old_policy }}) -> {{ toe_image }} (IfNotPresent){{
-              '; already in place, nothing to change' if (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent') else '' }}
+              '; nodeSelector ' ~ toe_pin_line ~ (' already there' if toe_pod_state == 'present' else ' to be added')
+              ~ ', the TOE runs on node ' ~ toe_pin_node if toe_pin_server | bool else '; no nodeSelector (toe_pin_server=false)' }}{{
+              '; already in place, nothing to change' if not (toe_edit_needed | bool) else '' }}
 
         # What the new TOE deletes on its first start. The new TOE prunes every recorded item that the config no
         # longer has; the old TOE did not when an apply failed (it returned before pruning), so such items may
@@ -196,7 +222,7 @@
 
         - name: Refuse to roll while the new TOE would delete items (unless -e toe_allow_prune=true)
           ansible.builtin.assert:
-            that: toe_allow_prune | bool or (toe_prune_keys | from_json | length) == 0 or (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent')
+            that: toe_allow_prune | bool or (toe_prune_keys | from_json | length) == 0 or not (toe_edit_needed | bool)
             fail_msg: >-
               {{ inventory_hostname }}: the new TOE would delete {{ toe_prune_keys | from_json | length }} item(s) on its first start:
               {{ toe_prune_keys | from_json | join(', ') }}. The old TOE never pruned them (it stopped at its first create error),
@@ -289,7 +315,7 @@
             that: >-
               toe_allow_changes | bool or
               ((toe_plan | from_json).create + (toe_plan | from_json).change + (toe_plan | from_json).fallback + (toe_plan | from_json).error) | length == 0 or
-              (toe_old_image == toe_image and toe_old_policy == 'IfNotPresent')
+              not (toe_edit_needed | bool)
             fail_msg: >-
               {{ inventory_hostname }}: on its first start the new TOE re-applies every config item, and it would
               create {{ (toe_plan | from_json).create | join(', ') | default('-', true) }};
@@ -304,7 +330,7 @@
         - name: Pre-pull the image and check its digest (shared with rebootstrap-device.yml)
           ansible.builtin.import_tasks: tasks/toe-image-pull.yml
 
-        - name: Back up the manifest, put the image on the toe container, wait for the rollout (shared with rebootstrap-device.yml)
+        - name: Back up the manifest, put the image on the toe container, pin the pod, wait for the rollout (shared with rebootstrap-device.yml)
           ansible.builtin.import_tasks: tasks/toe-manifest-set-image.yml
 
       rescue:
@@ -371,11 +397,27 @@
             fail_msg: "{{ toe_restore_from }} does not look like the Teknoir manifest. Nothing was changed."
             quiet: true
 
+        # A backup made before the pin has no nodeSelector, and restoring it would bring the TOE back onto an agent
+        # node of a multi-node robot. So the backup gets the same pre-flight check as a rollout (pod spec found
+        # exactly once, no other nodeSelector, exactly one node with the control-plane label), before anything is
+        # changed, and the pin is applied after the restore. -e toe_pin_server=false restores the backup as it is.
+        - name: Which pod spec and nodeSelector the backup has (the manifest tasks read the backup, not the manifest)
+          ansible.builtin.set_fact:
+            toe_read_src: "{{ toe_restore_from }}"
+
+        - name: Read the backup's toe pod spec (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-manifest-read.yml
+
+        - name: Check that the TOE pod can be pinned to the server node after the restore (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-pin-check.yml
+
         - name: Plan
           ansible.builtin.debug:
             msg: >-
               {{ inventory_hostname }}: restore {{ toe_restore_from }}
-              (image {{ toe_bak_found[0][1] }}) over {{ toe_manifest }} (image {{ toe_old_image }})
+              (image {{ toe_bak_found[0][1] }}) over {{ toe_manifest }} (image {{ toe_old_image }}){{
+              ('; nodeSelector ' ~ toe_pin_line ~ (' already in the backup' if toe_pod_state == 'present' else ' to be added after the restore')
+              ~ ', the TOE runs on node ' ~ toe_pin_node) if toe_pin_server | bool else '; no nodeSelector added (toe_pin_server=false)' }}
 
         - name: Keep the manifest that is being replaced
           ansible.builtin.copy:
@@ -393,6 +435,9 @@
             mode: preserve
           diff: false  # the manifest holds Secrets: --diff must not print it
 
+        - name: Pin the TOE pod to the server node again (the backup has no nodeSelector; shared with the rollout)
+          ansible.builtin.import_tasks: tasks/toe-manifest-pin.yml
+
         - name: Wait for the Deployment to carry the restored image
           ansible.builtin.command:
             argv: "{{ toe_kubectl_cmd + toe_get_image_argv }}"
@@ -405,11 +450,8 @@
           changed_when: false
           when: not ansible_check_mode
 
-        - name: Wait for the rollout
-          ansible.builtin.command:
-            argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
-          changed_when: false
-          when: not ansible_check_mode
+        - name: Wait for the nodeSelector, the rollout and the TOE pod on the server node
+          ansible.builtin.import_tasks: tasks/toe-manifest-wait.yml
 
     # ------------------------------------------------------------------ report
     - name: Read the TOE pod
