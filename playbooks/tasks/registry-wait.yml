@@ -1,0 +1,75 @@
+---
+# Wait for k3s after a restart (included by playbooks/registry-mirror.yml; needs registry_unit and registry_is_server).
+# Server: the node and the TOE are Ready. Agent: its unit is active and containerd reports the runtime ready (an agent
+# has no apiserver to ask; its node is checked from the server).
+- name: Wait for the k3s unit to be active
+  ansible.builtin.command:
+    argv: "{{ registry_systemctl_cmd + ['is-active', registry_unit] }}"
+  register: registry_active
+  until: registry_active.stdout == 'active'
+  retries: "{{ (registry_wait_timeout | int / 5) | int }}"
+  delay: 5
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: The k3s unit is active
+  ansible.builtin.assert:
+    that: registry_active.stdout == 'active'
+    fail_msg: "{{ inventory_hostname }}: {{ registry_unit }} is not active {{ registry_wait_timeout }} s after the restart."
+    quiet: true
+
+- name: Server, wait for the node and the TOE
+  when: registry_is_server | bool
+  block:
+    - name: Read config.yaml for the node name
+      ansible.builtin.slurp:
+        src: "{{ registry_config_yaml }}"
+      register: registry_cfg
+      failed_when: false
+      check_mode: false
+
+    - name: The host name (the node name when config.yaml sets none)
+      ansible.builtin.command:
+        argv: "{{ registry_hostname_cmd }}"
+      register: registry_hostname
+      changed_when: false
+      check_mode: false
+      when: registry_node_name == ''
+
+    - name: The node name
+      ansible.builtin.set_fact:
+        registry_node: >-
+          {{ registry_node_name if registry_node_name != '' else
+          ((registry_cfg.content | default('') | b64decode | regex_search('(?m)^node-name:\s*["\']?([^"\'\s]+)', '\1')) or [registry_hostname.stdout | trim | lower])[0] }}
+
+    - name: Wait for the node to be Ready
+      ansible.builtin.command:
+        argv: "{{ registry_kubectl_cmd + ['get', 'node', registry_node, '-o', 'jsonpath=' ~ registry_ready_jsonpath] }}"
+      register: registry_node_ready
+      until: registry_node_ready.rc == 0 and registry_node_ready.stdout == 'True'
+      retries: "{{ (registry_wait_timeout | int / 5) | int }}"
+      delay: 5
+      changed_when: false
+      check_mode: false
+      vars:
+        registry_ready_jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'
+
+    - name: Wait for the TOE to be Ready
+      ansible.builtin.command:
+        argv: "{{ registry_kubectl_cmd + ['-n', registry_toe_namespace, 'rollout', 'status', 'deploy/' ~ registry_toe_deployment, '--timeout=' ~ registry_wait_timeout ~ 's'] }}"
+      changed_when: false
+      check_mode: false
+
+- name: Agent, wait for containerd
+  when: not (registry_is_server | bool)
+  ansible.builtin.command:
+    argv: "{{ registry_crictl_cmd + ['info'] }}"
+  register: registry_ci
+  until: >-
+    registry_ci.rc == 0 and
+    ((registry_ci.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'RuntimeReady') | selectattr('status', 'equalto', true) | list | length) == 1
+  retries: "{{ (registry_wait_timeout | int / 5) | int }}"
+  delay: 5
+  changed_when: false
+  check_mode: false

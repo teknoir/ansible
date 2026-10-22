@@ -240,6 +240,76 @@ TOE pod on another node after the rollout (restored), a Failed or terminating TO
 on a robot with two labelled nodes), `toe_pin_server=false`, the manifest of the cli bootstrap template (recognised as
 already pinned, `tests/toe-image/cli-server.teknoir.yaml`), and that the manifest Secret is never printed. `tests/toe-keep/run.sh` covers the pin in the re-bootstrap restore.
 
+## Registry mirror (Harbor pull-through cache)
+`playbooks/registry-mirror.yml` makes a robot that already runs pull its images through the platform's Harbor
+(`harbor.<domain>`): Docker Hub, GitHub (`ghcr.io`), `gcr.io`, `quay.io`, `registry.k8s.io` and `nvcr.io` map to the
+Harbor proxy-cache projects `dockerhub`, `ghcr`, `gcr`, `quay`, `k8s` and `nvcr`. It writes
+`/etc/rancher/k3s/registries.yaml` (root, `0600`, first line `# managed by teknoir`). k3s always tries the upstream
+registry last, so a Harbor outage never blocks public images. New robots get the same file from
+`tnctl bootstrap --registry-mirror`. Design: `plans/harbor-proxy-staging.md` (workspace).
+
+```bash
+# Only look: the probe runs (it only reads), the diff is redacted, nothing is changed
+tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_kube_context=vpro --check --diff
+
+# Apply (one device at a time)
+tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_kube_context=vpro
+
+# Roll back: restore the newest backup (or -e registry_backup=<file>), restart k3s if the file changes
+tnctl ansible-playbook playbooks/registry-mirror.yml --limit vm-fresh-01 -e registry_rollback=true
+```
+
+Per device (`serial: 1`, `any_errors_fatal`, `max_fail_percentage: 0`). `--limit` is required and must name exactly one
+device (`all`, wildcards and patterns that match several are refused unless `-e registry_allow_many=true`).
+1. **pre-flight** on the device: a `k3s` or `k3s-agent` unit, not Docker mode, `KillMode=process` (a k3s restart then
+   leaves the pods running; with any other KillMode it would stop them, so the run is refused), and a `registries.yaml`
+   whose first line is not `# managed by teknoir` (or `# managed by tnctl bootstrap`) belongs to the device owner and
+   is refused unless `-e registry_allow_replace=true`;
+2. **credential**, read on the controller with `no_log`: Secret `teknoir-system/harbor-teamspace-pull` of the kube
+   context `registry_kube_context`, keys `<ansible_teknoir_namespace>.username` and `.password` (only those two keys are
+   fetched; harbor-config creates the robot of every teamspace). The context is required and never defaulted; a
+   production context is refused;
+3. **probe from the device**, before anything is changed: `https://<host>/v2/` answers `401` with a valid TLS chain, a
+   token for `repository:dockerhub/rancher/mirrored-pause:pull` is issued for the credential and a `HEAD` of that
+   manifest through Harbor answers `200`. The credential and the token go to curl on stdin (a curl config), never in an
+   argument list. A failed probe stops the run with nothing changed;
+4. **redacted `--diff`** of `registries.yaml` (the password shows as `********`; when only the credential changes the
+   plan says so);
+5. **backup** to `/var/lib/rancher/k3s/registry-mirror-backups/registries.yaml.bak-<UTC>` (outside the k3s directories,
+   `0600`), or `registries.yaml.absent-<UTC>` when the device had no file;
+6. **write** the file (root, `0600`; only when it differs);
+7. **restart k3s only when the file changed**, then wait: on a server the node and the TOE are Ready, on an agent
+   the unit is active and containerd reports the runtime ready (an agent has no apiserver to ask);
+8. **checks**: containerd's `docker.io` `hosts.toml` names `https://<host>/v2/dockerhub`, and `k3s crictl pull
+   docker.io/rancher/mirrored-pause:3.6` works;
+9. **on any failure after step 6**: restores the backup (or removes the file), restarts k3s, waits, then fails.
+
+`-e registry_rollback=true` restores the newest backup (the file it replaces is kept as `registries.yaml.pre-rollback-<UTC>`),
+restarts k3s only if the file changes, and waits. `--check` stops after step 4. A second run changes nothing (no
+backup, no restart). The credential is never printed: not in the plan, the diff, the task output or `-vvv`.
+
+Variables: `registry_kube_context` (required unless rolling back), `registry_host` (default
+`harbor.<ansible_teknoir_domain>`), `registry_rollback`, `registry_backup`, `registry_allow_replace`,
+`registry_allow_many`, `registry_wait_timeout` (300), `registry_node_name` (default: `node-name` of
+`/etc/rancher/k3s/config.yaml`, else the host name); the paths and commands (`registry_file`, `registry_file_owner`,
+`registry_backup_dir`, `registry_hosts_toml`, `registry_config_yaml`, `registry_*_cmd`, `registry_use_become`) default to a
+Teknoir device.
+
+Order: a VM device first, then real devices one at a time (check TOE Ready, no new restarts and unchanged pod start
+times before the next). Production devices only with the usual production OK. The agent nodes of multi-node robots
+are not in the tnctl inventory and keep pulling from upstream.
+
+**Test it without a device** (stubbed `kubectl`, `curl`, `crictl`, `systemctl`, `hostname`; no root, no network; takes
+about two minutes):
+```bash
+tests/registry-mirror/run.sh
+```
+It covers the guards (`--limit`, kube context), the pre-flight (KillMode, Docker mode, no k3s, a foreign file, a file
+from `tnctl bootstrap`), a fresh install, a no-op re-run, `--check --diff`, a rotated credential, rollback (newest,
+named, absent-marker, no backup), probe failures (TLS, no credential, refused credential, manifest not served: nothing
+changed), failures after the write (probe pull, restart, `hosts.toml`, node not Ready: restored), the node name, an
+agent, and that the password, the token and the robot secret appear in no output, also with `-vvv`.
+
 ## Node roles
 A node role is a set of k3s node labels (and optional taints), so workloads can be assigned to the nodes that fill
 the role with a plain `nodeSelector`:

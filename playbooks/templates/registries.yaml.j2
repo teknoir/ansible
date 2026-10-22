@@ -1,0 +1,17 @@
+# managed by teknoir
+# k3s private registry mirrors: pull-through cache on {{ registry_host }} (plans/harbor-proxy-staging.md).
+# containerd asks Harbor first and falls back to the upstream registry. Written by
+# playbooks/registry-mirror.yml; do not edit (registry_rollback=true restores the previous file).
+mirrors:
+{% for upstream, project in registry_mirrors.items() %}
+  {{ upstream }}:
+    endpoint:
+      - {{ ('https://' ~ registry_host) | to_json }}
+    rewrite:
+      "^(.*)$": {{ (project ~ '/$1') | to_json }}
+{% endfor %}
+configs:
+  {{ registry_host | to_json }}:
+    auth:
+      username: {{ registry_user | to_json }}
+      password: {{ registry_pass | to_json }}
