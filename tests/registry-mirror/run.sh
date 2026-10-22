@@ -112,7 +112,7 @@ printf '#!/bin/sh\necho Teknoir-Master\n' > "$work/bin/hostname"
 chmod +x "$work/bin/"*
 export STUB_USER_PLAIN="$USERNAME"
 
-unit_server() { printf 'LoadState=loaded\nKillMode=%s\nExecStart={ path=/usr/local/bin/k3s ; argv[]=/usr/local/bin/k3s server %s ; ignore_errors=no }\n' "${1:-process}" "${2:-}" > "$S/unit-k3s"; rm -f "$S/unit-k3s-agent"; }
+unit_server() { printf 'LoadState=loaded\nKillMode=%s\nExecStart={ path=/usr/local/bin/k3s ; argv[]=/usr/local/bin/k3s server %s ; ignore_errors=no }\n%s' "${1:-process}" "${2:-}" "${3:-}" > "$S/unit-k3s"; rm -f "$S/unit-k3s-agent"; }
 unit_agent() { printf 'LoadState=loaded\nKillMode=process\nExecStart={ path=/usr/local/bin/k3s ; argv[]=/usr/local/bin/k3s agent ; ignore_errors=no }\n' > "$S/unit-k3s-agent"; rm -f "$S/unit-k3s"; }
 unit_server
 
@@ -309,7 +309,7 @@ o=$(go -e registry_proof_image=ghcr.io/teknoir/other:1); ok "proof image: a regi
 
 # ---- k3s data directory: default, config.yaml, drop-ins (later wins), the unit's --data-dir, and a missing agent dir
 dd_dir() { mkdir -p "$1/agent/etc/containerd/certs.d/docker.io"; }
-dd_dir "$work/dd-cfg"; dd_dir "$work/dd-a"; dd_dir "$work/dd-b"; dd_dir "$work/dd-cli"
+dd_dir "$work/dd-cfg"; dd_dir "$work/dd-a"; dd_dir "$work/dd-b"; dd_dir "$work/dd-cli"; dd_dir "$work/dd-lower"; dd_dir "$work/dd-upper"; dd_dir "$work/dd-env"; dd_dir "$work/dd-env2"
 reset
 o=$(go); ok "data-dir default: hosts.toml is read under the default data directory" "echo \"\$o\" | grep -q 'failed=0' && [ -f $DD/$HTREL ]"
 reset; printf 'write-kubeconfig-mode: "0644"\ndata-dir: %s\n' "$work/dd-cfg" > "$CFG"; export STUB_HT="$work/dd-cfg/$HTREL"
@@ -322,6 +322,36 @@ reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "--d
 o=$(go); ok "data-dir from the unit's ExecStart wins over config.yaml" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
 reset; unit_server process "-d=$work/dd-cli"; export STUB_HT="$work/dd-cli/$HTREL"
 o=$(go); ok "data-dir from the unit's -d=<dir>" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ]"
+# drop-ins in BYTE order like k3s (os.ReadDir): B.yaml sorts before a.yaml, so a.yaml is applied last and wins
+reset; mkdir -p "$CFG.d"; printf 'data-dir: %s\n' "$work/dd-upper" > "$CFG.d/B.yaml"; printf 'data-dir: %s\n' "$work/dd-lower" > "$CFG.d/a.yaml"
+export STUB_HT="$work/dd-lower/$HTREL"
+o=$(go); ok "data-dir drop-ins: byte order like k3s (B.yaml before a.yaml, so a.yaml wins)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-lower/$HTREL ] && [ ! -e $work/dd-upper/$HTREL ]"
+# K3S_DATA_DIR of the unit: Environment= and EnvironmentFiles= (install.sh writes k3s.service.env, quoted or not)
+reset; unit_server process "" "Environment=K3S_DATA_DIR=$work/dd-env"; export STUB_HT="$work/dd-env/$HTREL"
+o=$(go); ok "data-dir from K3S_DATA_DIR in Environment= of the unit" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-env/$HTREL ] && [ ! -e $DD/$HTREL ]"
+printf "K3S_TOKEN='SECRETenvTOKEN'\nK3S_DATA_DIR='%s'\n" "$work/dd-env2" > "$work/k3s.service.env"; chmod 600 "$work/k3s.service.env"
+reset; unit_server process "" "EnvironmentFiles=$work/k3s.service.env (ignore_errors=yes)"; export STUB_HT="$work/dd-env2/$HTREL"
+o=$(go -v); ok "data-dir from K3S_DATA_DIR in an EnvironmentFile (and the token in it is never printed)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-env2/$HTREL ] && ! echo \"\$o\" | grep -q SECRETenvTOKEN"
+reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "" "EnvironmentFiles=$work/k3s.service.env (ignore_errors=yes)"; export STUB_HT="$work/dd-cfg/$HTREL"
+o=$(go); ok "data-dir precedence: config.yaml beats K3S_DATA_DIR" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cfg/$HTREL ] && [ ! -e $work/dd-env2/$HTREL ]"
+reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "--data-dir $work/dd-cli" "Environment=K3S_DATA_DIR=$work/dd-env"; export STUB_HT="$work/dd-cli/$HTREL"
+o=$(go); ok "data-dir precedence: the CLI flag beats config.yaml and K3S_DATA_DIR" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ] && [ ! -e $work/dd-env/$HTREL ]"
+# a non-default config path: --config/-c of the unit, or K3S_CONFIG_FILE (the .d directory sits next to it)
+ALT="$work/alt/k3s.yaml"; mkdir -p "$work/alt"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt"; printf 'data-dir: %s\n' "$work/dd-a" > "$ALT"; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"
+unit_server process "--config $ALT"; export STUB_HT="$work/dd-a/$HTREL"
+o=$(go); ok "config path from --config of the unit (the default config.yaml is not read)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt/k3s.yaml.d"; printf 'data-dir: %s\n' "$work/dd-a" > "$ALT"; printf 'data-dir: %s\n' "$work/dd-b" > "$ALT.d/10.yaml"
+unit_server process "-c=$ALT"; export STUB_HT="$work/dd-b/$HTREL"
+o=$(go); ok "config path from -c=<file>: its .d drop-ins are read too" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-b/$HTREL ] && [ ! -e $work/dd-a/$HTREL ]"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt"; printf 'data-dir: %s\n' "$work/dd-a" > "$ALT"; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"
+unit_server process "" "Environment=K3S_URL=https://x:6443 K3S_CONFIG_FILE=$ALT"; export STUB_HT="$work/dd-a/$HTREL"
+o=$(go); ok "config path from K3S_CONFIG_FILE of the unit" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
+reset; rm -rf "$work/alt"; mkdir -p "$work/alt"; printf 'data-dir: %s\n' "$work/missing" > "$ALT"
+unit_server process "--config $ALT"
+o=$(go); ok "a missing agent dir from an env/--config source is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ ! -d $B ] && [ \$(restarts) = 0 ] && ! grep -q 'get secret' $S/kubectl.log && [ ! -s $S/curl.log ]"
+reset; unit_server process "" "Environment=K3S_DATA_DIR=$work/missing-env"
+o=$(go); ok "a K3S_DATA_DIR without an agent dir is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ \$(restarts) = 0 ] && ! grep -q 'get secret' $S/kubectl.log"
 reset; export STUB_HT="$work/dd-a/$HTREL"
 o=$(go -e registry_data_dir="$work/dd-a"); ok "-e registry_data_dir overrides the search" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ]"
 reset; printf 'data-dir: %s\n' "$work/missing" > "$CFG"
