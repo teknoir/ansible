@@ -19,6 +19,43 @@ print("[DEPRECATED] The Teknoir Ansible inventory plugin is replaced by tnctl: "
       "tnctl ansible / tnctl ansible-playbook (https://github.com/teknoir/cli/blob/main/docs/commands/ansible.md)",
       file=sys.stderr)
 
+# The audience and scope of the WireGuard hub. A token that has the audience opens hub sessions,
+# so this script must never send one to Backstage (it only needs the main token); see tnctl login.
+ZTNA = 'teknoir-ztna'
+MAIN_SCOPE = 'openid profile email offline_access'
+
+
+def jwt_claims(token):
+    """The (unverified) claims of a JWT, or {} for anything that is not one."""
+    try:
+        payload = str(token).split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode('utf-8')))
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def has_hub_audience(token):
+    aud = jwt_claims(token).get('aud') or []
+    if isinstance(aud, str):
+        aud = [aud]
+    return ZTNA in aud
+
+
+def main_scope(refresh_token):
+    """The scopes to redeem a refresh token with: what it was granted minus the hub scope.
+
+    A refresh without a scope parameter returns every granted scope, the hub audience included.
+    Returns None when the token has no scope claim or was not granted the hub scope: then the
+    plain refresh (no scope parameter) cannot add the audience, and sending one could ask for more
+    than was granted.
+    """
+    granted = str(jwt_claims(refresh_token).get('scope') or '').split()
+    if ZTNA not in granted:
+        return None
+    return ' '.join(sc for sc in granted if sc != ZTNA) or MAIN_SCOPE
+
 
 class TeknoirInventory(object):
 
@@ -94,6 +131,9 @@ class TeknoirInventory(object):
         should_refresh = False
         if not access_token:
             should_refresh = True
+        elif has_hub_audience(access_token):
+            # What `tnctl login` stored before it learned to downscope: never send it on.
+            should_refresh = True
         elif expiry_str:
             try:
                 expiry = datetime.datetime.fromisoformat(expiry_str)
@@ -127,12 +167,19 @@ class TeknoirInventory(object):
         }
         if client_secret:
             data['client_secret'] = client_secret
+        scope = main_scope(refresh_token)
+        if scope:
+            data['scope'] = scope
 
         response = requests.post(token_url, data=data)
         if response.status_code != 200:
             raise Exception(f"Failed to refresh token for {domain}: {response.text}")
 
         new_token_data = response.json()
+        if has_hub_audience(new_token_data.get('access_token')):
+            # Backstage must not get a token the WireGuard hub accepts.
+            raise Exception(f"Refreshed token for {domain} has the {ZTNA} audience; not using it. "
+                            "Run `tnctl login` again, or use `tnctl ansible-inventory`.")
         auth['access_token'] = new_token_data['access_token']
         if 'refresh_token' in new_token_data:
             auth['refresh_token'] = new_token_data['refresh_token']
