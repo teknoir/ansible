@@ -314,6 +314,7 @@
             dest: "{{ toe_manifest }}"
             remote_src: true
             mode: preserve
+          diff: false  # the manifest holds Secrets: --diff must not print it
           when: toe_bak is defined and toe_bak.dest is defined
 
         - name: Wait for the old TOE to be Ready again
@@ -382,6 +383,7 @@
             dest: "{{ toe_backup_dir }}/teknoir.yaml.pre-rollback-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
             remote_src: true
             mode: preserve
+          diff: false  # the manifest holds Secrets: --diff must not print it
 
         - name: Restore the backup
           ansible.builtin.copy:
@@ -389,6 +391,7 @@
             dest: "{{ toe_manifest }}"
             remote_src: true
             mode: preserve
+          diff: false  # the manifest holds Secrets: --diff must not print it
 
         - name: Wait for the Deployment to carry the restored image
           ansible.builtin.command:

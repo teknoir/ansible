@@ -61,6 +61,7 @@
         dest: "{{ toe_manifest }}"
         remote_src: true
         mode: preserve
+      diff: false  # the manifest holds Secrets: --diff must not print it
       when: toe_bak is defined and toe_bak.dest is defined
 
     - name: The hint below is the message
@@ -75,3 +76,11 @@
           else 'the manifest was not changed by this step' }}): {{ ansible_failed_result.msg | default('') }}
           The TOE may run the template's toe_v4. Check it (kubectl -n kube-system get pods) and put the image
           back with playbooks/toe-image.yml -e toe_image={{ tn_toe_keep }}
+      when: tn_toe_keep | default('') != ''
+
+    - name: Checking the TOE image failed (nothing was remembered to put back)
+      ansible.builtin.fail:
+        msg: >-
+          {{ rebootstrap_device }}: checking the TOE image after the bootstrap script failed:
+          {{ ansible_failed_result.msg | default('') }}
+      when: tn_toe_keep | default('') == ''

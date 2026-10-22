@@ -152,6 +152,12 @@ for v in -v -vvv; do
   ok "$v run restored the image" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$PINNED\" ]"
   ok "$v: the Secret in the manifest is never printed (plain or base64)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
 done
+for v in "--diff -vvv" "--check --diff -vvv"; do
+  mk "$PINNED" IfNotPresent; o=$(run -e fake_script=rewrite $v)
+  ok "$v: the Secret in the manifest is never printed (plain or base64)" "echo \"\$o\" | grep -q 'PLAY RECAP' && ! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+done
+mk "$PINNED" IfNotPresent; o=$(run -e fake_script=rewrite --diff -vvv)
+ok "--diff -vvv run restored the image" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$PINNED\" ]"
 mk "$PINNED" IfNotPresent; o=$(run -e fake_script=delete -vvv)
 ok "-vvv failing run: the Secret is never printed (plain or base64)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
 

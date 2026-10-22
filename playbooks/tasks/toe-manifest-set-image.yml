@@ -17,6 +17,7 @@
     dest: "{{ toe_backup_dir }}/teknoir.yaml.bak-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
     remote_src: true
     mode: preserve
+  diff: false  # the manifest holds Secrets: --diff must not print it
   register: toe_bak
   when: (toe_old_image != toe_image or toe_old_policy != 'IfNotPresent') and not ansible_check_mode
 
@@ -25,6 +26,7 @@
     path: "{{ toe_manifest }}"
     regexp: '{{ toe_re }}'
     replace: '\g<1>{{ toe_image }}\g<3>IfNotPresent'
+  diff: false  # the manifest holds Secrets: --diff must not print it
   register: toe_edit
 
 - name: Wait for the Deployment to carry the new image (k3s re-applies the file)
