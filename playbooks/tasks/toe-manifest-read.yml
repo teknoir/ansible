@@ -1,14 +1,32 @@
 ---
 # Read the TOE manifest and find the toe container in it (the image line after `command: - /manager`).
 # Sets toe_found: a list with one [prefix, image, middle, policy] entry per toe container (exactly one on a
-# Teknoir device). With toe_read_optional=true an unreadable manifest gives an empty list instead of a failure.
-# Needs toe_manifest and toe_re (playbooks/vars/toe-manifest.yml); the caller sets become.
+# Teknoir device), and toe_manifest_present. With toe_read_optional=true a missing manifest gives an empty
+# list instead of a failure. Needs toe_manifest and toe_re (playbooks/vars/toe-manifest.yml); the caller sets
+# become.
+#
+# The manifest holds Secrets (the image pull secrets), so the slurp has no_log and nothing but the regex
+# groups of the toe container is kept: the file content must never reach the output, whatever the verbosity.
+- name: Is the TOE manifest there
+  ansible.builtin.stat:
+    path: "{{ toe_manifest }}"
+  register: toe_manifest_stat
+
+- name: Refuse a missing TOE manifest
+  ansible.builtin.assert:
+    that: toe_manifest_stat.stat.exists
+    fail_msg: "TOE manifest not found at {{ toe_manifest }} (a custom k3s data-dir? pass -e toe_manifest=<data-dir>/server/manifests/teknoir.yaml)."
+    quiet: true
+  when: not (toe_read_optional | default(false) | bool)
+
 - name: Read the TOE manifest
   ansible.builtin.slurp:
     src: "{{ toe_manifest }}"
   register: toe_file
-  failed_when: toe_file.failed | default(false) and not (toe_read_optional | default(false) | bool)
+  no_log: true  # the manifest holds Secrets
+  when: toe_manifest_stat.stat.exists
 
 - name: Find the toe container in the manifest
   ansible.builtin.set_fact:
-    toe_found: "{{ (toe_file.content | default('') | b64decode) | regex_findall(toe_re, multiline=True) }}"
+    toe_manifest_present: "{{ toe_manifest_stat.stat.exists }}"
+    toe_found: "{{ ((toe_file.content | default('') | b64decode) | regex_findall(toe_re, multiline=True)) if toe_manifest_stat.stat.exists else [] }}"

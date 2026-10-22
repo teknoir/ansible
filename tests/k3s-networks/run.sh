@@ -65,12 +65,27 @@ printf '%s\n' 'cluster-cidr: 10.52.0.0/16' > "$d/k3s/config.yaml.d/20-vdevice-ne
 FAKE_POD=10.52.0.0/24 run
 [ $rc = 0 ] && [[ $out == *unchanged* ]] && [ "$(ls "$d/k3s/config.yaml.d")" = 20-vdevice-networks.yaml ] && ok "already in a drop-in: nothing written" || bad "dropin" "$rc $out"
 
-# 6. a later drop-in that disagrees with the unit would win after the reinstall: refuse
+# 6. a later drop-in that disagrees with the unit would win after the reinstall: refuse, and change nothing
 new conflict
 printf '%s\n' 'cluster-cidr: 10.70.0.0/16' > "$d/k3s/config.yaml.d/20-other.yaml"
 printf '%s\n' '[Service]' 'ExecStart=/usr/local/bin/k3s server --cluster-cidr=10.52.0.0/16' > "$d/k3s.service"
 run
-[ $rc = 6 ] && [[ $err == *overridden* ]] && ok "conflicting later drop-in: refused" || bad "conflict" "$rc $out $err"
+[ $rc = 6 ] && [[ $err == *overridden* ]] && [ "$(ls -A "$d/k3s/config.yaml.d")" = 20-other.yaml ] && ok "conflicting later drop-in: refused, no drop-in and no temp file left" || bad "conflict" "$rc $out $err $(ls -A "$d/k3s/config.yaml.d")"
+# an existing 10-k3s-networks.yaml is left as it was
+printf '%s\n' 'service-cidr: "10.53.0.0/16"' > "$d/k3s/config.yaml.d/10-k3s-networks.yaml"; cp "$d/k3s/config.yaml.d/10-k3s-networks.yaml" "$work/old10"
+run
+[ $rc = 6 ] && cmp -s "$d/k3s/config.yaml.d/10-k3s-networks.yaml" "$work/old10" && [ "$(ls -A "$d/k3s/config.yaml.d" | wc -l)" = 2 ] && ok "refusal leaves an existing 10-k3s-networks.yaml untouched" || bad "conflict existing" "$rc $err"
+# a missing config dir is created when the drop-in is written
+new conflict2; rm -rf "$d/k3s/config.yaml.d"; mkdir -p "$d/k3s"
+printf '%s\n' '[Service]' 'ExecStart=/usr/local/bin/k3s server --cluster-cidr=10.52.0.0/16' > "$d/k3s.service"
+run
+[ $rc = 0 ] && [ -f "$d/k3s/config.yaml.d/10-k3s-networks.yaml" ] && ok "missing config dir is created when the drop-in is written" || bad "no dir" "$rc $out $err"
+# an EARLIER drop-in with another value loses against the 10- file: written
+new earlier
+printf '%s\n' 'cluster-cidr: 10.70.0.0/16' > "$d/k3s/config.yaml.d/05-other.yaml"
+printf '%s\n' '[Service]' 'ExecStart=/usr/local/bin/k3s server --cluster-cidr=10.52.0.0/16' > "$d/k3s.service"
+run
+[ $rc = 0 ] && grep -qx 'cluster-cidr: "10.52.0.0/16"' "$d/k3s/config.yaml.d/10-k3s-networks.yaml" && ok "earlier drop-in with another value: ours wins, written" || bad "earlier" "$rc $out $err"
 
 # 7. undeterminable, podCIDR outside 10.42/16: refuse; service IP outside 10.43/16: refuse
 new refuse; FAKE_POD=10.52.0.0/24 run

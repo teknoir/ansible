@@ -1,0 +1,11 @@
+---
+# In the `always` of the re-bootstrap: while a digest-pinned TOE image was remembered
+# (toe-keep-remember.yml) and not yet put back or checked (toe-keep-restore.yml sets tn_toe_settled), say which
+# image to restore. Prints nothing otherwise. Needs rebootstrap_device.
+- name: Tell which TOE image to restore when the re-bootstrap did not get that far
+  ansible.builtin.debug:
+    msg: >-
+      The re-bootstrap of {{ rebootstrap_device }} stopped before its TOE image was checked. The device ran the
+      digest-pinned TOE image {{ tn_toe_keep }}; if the manifest ({{ toe_manifest }}) now carries the template's
+      toe_v4, put it back with playbooks/toe-image.yml -e toe_image={{ tn_toe_keep }}
+  when: tn_toe_keep | default('') != '' and not (tn_toe_settled | default(false) | bool)

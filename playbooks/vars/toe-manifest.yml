@@ -8,6 +8,7 @@ toe_backup_dir: /var/lib/rancher/k3s/server/toe-image-backups
 toe_namespace: kube-system
 toe_deployment: toe
 toe_kubectl_cmd: [k3s, kubectl]
+toe_crictl_cmd: [k3s, crictl]
 # The toe container is the one that follows `command: - /manager`; groups: 1 prefix, 2 image, 3 middle, 4 policy.
 toe_re: '([ ]+command:\n[ ]+- /manager\n[ ]+image: )(\S+)(\n[ ]+imagePullPolicy: )(\S+)'
 toe_wait_argv: "{{ ['-n', toe_namespace, 'rollout', 'status', 'deploy/' ~ toe_deployment, '--timeout=' ~ toe_wait_timeout ~ 's'] }}"

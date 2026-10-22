@@ -133,9 +133,13 @@ drop-in already holds them, and the run stops if they cannot be determined while
 10.42.0.0/16 (test: `tests/k3s-networks/run.sh`); remembers a TOE image that is pinned by digest (`@sha256:`): the
 bootstrap templates regenerate `teknoir.yaml` with the moving tag `docker.io/tekn0ir/toe:toe_v4` and
 `imagePullPolicy: Always`, which would undo a TOE rolled out with `playbooks/toe-image.yml`; after the script it puts
-the pinned image back the way `toe-image.yml` does (same shared tasks, `playbooks/tasks/toe-manifest-*.yml`: backup
-outside the manifests directory, image line replaced, `IfNotPresent`, wait for the rollout), prints one line
-(`TOE image: kept <image> ...` or `nothing to keep`) and leaves a TOE on a tag without a digest to the templates (test:
+the pinned image back the way `toe-image.yml` does (same shared tasks in `playbooks/tasks/`: `crictl pull` and digest
+check first, so an unpullable image never reaches the manifest; then backup outside the manifests directory, image line
+replaced, `IfNotPresent`, wait for the rollout), prints one line (`TOE image: kept <image> ...`, `nothing to keep`, or a
+WARNING when `teknoir.yaml` is not at the default path: custom k3s data-dir, pass `-e toe_manifest=<data-dir>/server/manifests/teknoir.yaml`)
+and leaves a TOE on a tag without a digest to the templates. The run fails, and prints `toe-image.yml -e toe_image=<image>`,
+when the image cannot be put back or the manifest no longer holds exactly one toe container; the same command is printed
+when the run stops earlier. The manifest holds the image pull Secrets and is never printed (`no_log`; test:
 `tests/toe-keep/run.sh`); copies the script root-only, runs it in the background
 (polled; a k3s restart may drop the connection for a while) with its output in `/var/log/teknoir-rebootstrap.log`,
 and removes it; removes duplicate members of the `users` and `sudo` groups that older scripts left; then checks

@@ -1,9 +1,11 @@
 ---
 # After the bootstrap script: when tn_toe_keep (toe-keep-remember.yml) is set and the script changed the
-# TOE image line (another image or imagePullPolicy other than IfNotPresent), put it back the way
-# playbooks/toe-image.yml does (toe-manifest-set-image.yml: backup outside the manifests directory, image
-# replaced, imagePullPolicy IfNotPresent, wait for the rollout). Prints one status line. If putting it back
-# fails, the manifest the script wrote is restored and the run fails.
+# TOE image line (another image, or imagePullPolicy other than IfNotPresent), put it back the way
+# playbooks/toe-image.yml does: pre-pull and digest check first (toe-image-pull.yml, an unpullable image never
+# reaches the manifest), then toe-manifest-set-image.yml (backup outside the manifests directory, image
+# replaced, imagePullPolicy IfNotPresent, wait for the rollout). Prints one status line. Fails the run, with
+# the toe-image.yml command to run, when the image cannot be put back or the manifest cannot be understood
+# any more; the manifest the script wrote is left (or restored after a failed rollout).
 # Needs the vars of playbooks/vars/toe-manifest.yml, toe_wait_timeout and rebootstrap_device.
 - name: Keep a digest-pinned TOE image across the re-bootstrap
   become: true
@@ -12,6 +14,13 @@
       ansible.builtin.import_tasks: toe-manifest-read.yml
       vars:
         toe_read_optional: true
+
+    - name: The manifest must still hold exactly one toe container when an image is to be kept
+      ansible.builtin.fail:
+        msg: >-
+          {{ toe_manifest }} has {{ toe_found | length }} toe container(s) after the bootstrap script (expected
+          exactly one: `command: - /manager` followed by image and imagePullPolicy){{ '; the file is missing' if not toe_manifest_present else '' }}.
+      when: tn_toe_keep != '' and toe_found | length != 1
 
     - name: The TOE image now, and what to put back
       ansible.builtin.set_fact:
@@ -22,9 +31,17 @@
           {{ tn_toe_keep != '' and toe_found | length == 1
           and (toe_found[0][1] != tn_toe_keep or toe_found[0][3] != 'IfNotPresent') }}
 
+    - name: Pre-pull the kept image and check its digest (shared with toe-image.yml)
+      ansible.builtin.import_tasks: toe-image-pull.yml
+      when: tn_toe_restore | bool
+
     - name: Put the digest-pinned TOE image back and wait for the rollout
       ansible.builtin.import_tasks: toe-manifest-set-image.yml
       when: tn_toe_restore | bool
+
+    - name: The TOE image is settled
+      ansible.builtin.set_fact:
+        tn_toe_settled: true
 
     - name: TOE image
       ansible.builtin.debug:
@@ -32,7 +49,10 @@
           {{ rebootstrap_device }}: TOE image: {{
           ('kept ' ~ tn_toe_keep ~ (' (put back after the bootstrap script, imagePullPolicy IfNotPresent)'
           if tn_toe_restore | bool else ' (the script left it)'))
-          if tn_toe_keep != '' else 'nothing to keep (no digest-pinned TOE image)' }}
+          if tn_toe_keep != '' else
+          ('WARNING: TOE manifest not found at ' ~ toe_manifest ~ ': custom k3s data-dir? the TOE image was not kept'
+          if (tn_toe_pre_missing | bool or not toe_manifest_present)
+          else 'nothing to keep (no digest-pinned TOE image)') }}
 
   rescue:
     - name: Failed, restore the manifest the script wrote (if it was changed)
@@ -43,10 +63,15 @@
         mode: preserve
       when: toe_bak is defined and toe_bak.dest is defined
 
-    - name: Putting the TOE image back failed
+    - name: The hint below is the message
+      ansible.builtin.set_fact:
+        tn_toe_settled: true
+
+    - name: The digest-pinned TOE image was not put back
       ansible.builtin.fail:
         msg: >-
-          {{ rebootstrap_device }}: putting the digest-pinned TOE image {{ tn_toe_keep }} back failed
+          {{ rebootstrap_device }}: the digest-pinned TOE image {{ tn_toe_keep }} was not put back
           ({{ 'the manifest of the script was restored' if toe_bak is defined and toe_bak.dest is defined
-          else 'the manifest was not changed' }}). Check the TOE (kubectl -n kube-system get pods) and use
-          playbooks/toe-image.yml -e toe_image={{ tn_toe_keep }}.
+          else 'the manifest was not changed by this step' }}): {{ ansible_failed_result.msg | default('') }}
+          The TOE may run the template's toe_v4. Check it (kubectl -n kube-system get pods) and put the image
+          back with playbooks/toe-image.yml -e toe_image={{ tn_toe_keep }}

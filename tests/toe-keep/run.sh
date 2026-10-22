@@ -21,11 +21,28 @@ case "$*" in
   *"rollout status"*) case "$img" in *badroll*) echo "timed out" >&2; exit 1;; esac; echo "deployment successfully rolled out";;
 esac
 S
-chmod +x "$work/bin/kubectl"
+cat > "$work/bin/crictl" <<'S'
+#!/bin/sh
+case "$1" in
+  pull) case "$2" in *unpullable*) echo "pull failed" >&2; exit 1;; esac; echo "Image is up to date";;
+  inspecti) case "$4" in *mismatch*) echo '{"status":{"repoDigests":["x@sha256:0"]}}';; *) echo "{\"status\":{\"repoDigests\":[\"$4\"]}}";; esac;;
+esac
+S
+chmod +x "$work/bin/kubectl" "$work/bin/crictl"
 export TOE_MANIFEST="$M"
 
+CANARY="CANARY-PULL-SECRET-$$-xyz"
+# slurp returns the file base64-encoded, so a leak shows as the base64 of the file: its first 60 characters
+B64HEAD=$(printf 'apiVersion: v1\nkind: Secret\nmetadata: {name: pull, namespace: kube-system}\ntype: kubernetes.io/dockerconfigjson\n' | base64 -w0 | cut -c1-60)
 mk() { # image policy
 cat > "$M" <<EOT
+apiVersion: v1
+kind: Secret
+metadata: {name: pull, namespace: kube-system}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: $CANARY
+---
 kind: Deployment
 metadata:
   name: toe
@@ -47,7 +64,7 @@ EOT
 }
 run() { ( cd "$here" && ansible-playbook -i localhost, -c local --limit localhost play.yml \
   -e ansible_become=false -e toe_manifest="$M" -e toe_backup_dir="$B" \
-  -e "{\"toe_kubectl_cmd\":[\"$work/bin/kubectl\"]}" "$@" ) 2>&1 | cat; }
+  -e "{\"toe_kubectl_cmd\":[\"$work/bin/kubectl\"],\"toe_crictl_cmd\":[\"$work/bin/crictl\"]}" "$@" ) 2>&1 | cat; }
 img() { awk '/- \/manager/{f=1;next} f&&/image:/{print $2;exit}' "$M"; }
 pol() { awk '/- \/manager/{f=1;next} f&&/imagePullPolicy:/{print $2;exit}' "$M"; }
 fail=0
@@ -82,17 +99,60 @@ mk "$TPL" Always; rm -rf "$B"
 o=$(run -e fake_script=rewrite)
 ok "template tag: nothing to keep" "echo \"\$o\" | grep -q 'nothing to keep' && [ \"\$(img)\" = \"$TPL\" ]"
 
-# 5. no manifest: no failure
+# 5. no manifest: no failure, a warning (see 11)
 rm -f "$M"
 o=$(run -e fake_script=keep)
-ok "no manifest: nothing to keep, no failure" "echo \"\$o\" | grep -q 'failed=0' && echo \"\$o\" | grep -q 'nothing to keep'"
+ok "no manifest: no failure" "echo \"\$o\" | grep -q 'failed=0'"
 
 # 6. the rollout of the kept image fails: the script's manifest is restored, the run fails
 mk "$BADROLL" IfNotPresent; rm -rf "$B"
 o=$(run -e fake_script=rewrite)
 ok "failed rollout: run fails, script's manifest restored" "echo \"\$o\" | grep -q 'failed=1' && [ \"\$(img)\" = \"$TPL\" ] && echo \"\$o\" | grep -q 'manifest of the script was restored'"
 
-# 7. the status line and the paths never carry a secret: nothing but image names are read
+# 7. the failed run prints no token-like output
 ok "no token-like output" "! echo \"\$o\" | grep -qi 'token'"
+
+# 8. unpullable / wrong-digest pinned image: never reaches the manifest, the run fails with the hint
+UNPULL="docker.io/tekn0ir/toe:unpullable@sha256:$D1"
+mk "$UNPULL" IfNotPresent; rm -rf "$B"
+o=$(run -e fake_script=rewrite)
+ok "unpullable image: run fails, the script's manifest is left, no backup, hint names the image" "echo \"\$o\" | grep -q 'failed=1' && [ \"\$(img)\" = \"$TPL\" ] && [ ! -d $B ] && echo \"\$o\" | grep -q 'playbooks/toe-image.yml -e toe_image=$UNPULL'"
+MISM="docker.io/tekn0ir/toe:mismatch@sha256:$D1"
+mk "$MISM" IfNotPresent; rm -rf "$B"
+o=$(run -e fake_script=rewrite)
+ok "digest mismatch: run fails, the script's manifest is left" "echo \"\$o\" | grep -q 'failed=1' && [ \"\$(img)\" = \"$TPL\" ] && [ ! -d $B ] && echo \"\$o\" | grep -q 'does not carry the digest'"
+
+# 9. the manifest cannot be understood after the script, an image was to be kept: fail with the hint
+mk "$PINNED" IfNotPresent
+o=$(run -e fake_script=delete)
+ok "manifest gone after the script: fails with the hint (not 'the script left it')" "echo \"\$o\" | grep -q 'failed=1' && ! echo \"\$o\" | grep -q 'the script left it' && echo \"\$o\" | grep -q 'playbooks/toe-image.yml -e toe_image=$PINNED'"
+mk "$PINNED" IfNotPresent
+o=$(run -e fake_script=double)
+ok "two toe containers after the script: fails with the hint" "echo \"\$o\" | grep -q 'failed=1' && echo \"\$o\" | grep -q '2 toe container' && echo \"\$o\" | grep -q 'playbooks/toe-image.yml -e toe_image=$PINNED'"
+
+# 10. a step between the script and the restore fails: the hint is printed; a good run prints none
+mk "$PINNED" IfNotPresent
+o=$(run -e fake_script=rewrite -e fake_fail=true)
+ok "failure before the restore: hint with the pinned image" "echo \"\$o\" | grep -q 'failed=1' && echo \"\$o\" | grep -q 'stopped before its TOE image was checked' && echo \"\$o\" | grep -q 'toe_image=$PINNED'"
+mk "$PINNED" IfNotPresent
+o=$(run -e fake_script=rewrite)
+ok "good run: no hint" "! echo \"\$o\" | grep -q 'stopped before its TOE image'"
+mk "$TPL" Always
+o=$(run -e fake_script=rewrite -e fake_fail=true)
+ok "nothing remembered: no hint on failure" "echo \"\$o\" | grep -q 'failed=1' && ! echo \"\$o\" | grep -q 'stopped before its TOE image'"
+
+# 11. no manifest at the default path (custom k3s data-dir): a clear warning, not "nothing to keep"
+rm -f "$M"
+o=$(run -e fake_script=keep)
+ok "missing manifest: warning names the path and the data-dir" "echo \"\$o\" | grep -q 'WARNING: TOE manifest not found at $M: custom k3s data-dir? the TOE image was not kept' && ! echo \"\$o\" | grep -q 'nothing to keep'"
+
+# 12. the manifest holds Secrets: its content is never printed, at any verbosity
+for v in -v -vvv; do
+  mk "$PINNED" IfNotPresent; o=$(run -e fake_script=rewrite $v)
+  ok "$v run restored the image" "echo \"\$o\" | grep -q 'failed=0' && [ \"\$(img)\" = \"$PINNED\" ]"
+  ok "$v: the Secret in the manifest is never printed (plain or base64)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
+done
+mk "$PINNED" IfNotPresent; o=$(run -e fake_script=delete -vvv)
+ok "-vvv failing run: the Secret is never printed (plain or base64)" "! echo \"\$o\" | grep -q '$CANARY' && ! echo \"\$o\" | grep -qF '$B64HEAD'"
 
 [ $fail = 0 ] && echo "all passed" || { echo "FAILED"; exit 1; }

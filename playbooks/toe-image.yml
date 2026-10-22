@@ -68,7 +68,6 @@
     toe_allow_many: false
     toe_cr: toes.teknoir.org
     toe_cr_name: toe-config
-    toe_crictl_cmd: [k3s, crictl]
     toe_use_become: true
     toe_image_re: '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$'
     toe_jsonpath_pods: >-
@@ -76,7 +75,7 @@
       {.status.containerStatuses[?(@.name=="toe")].imageID}
       restarts={.status.containerStatuses[?(@.name=="toe")].restartCount}{"\n"}{end}
   become: "{{ toe_use_become | bool }}"
-  # toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_re and the argv of the waits
+  # toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_crictl_cmd, toe_re and the argv of the waits
   vars_files:
     - vars/toe-manifest.yml
 
@@ -302,33 +301,8 @@
               or pass -e toe_allow_changes=true to accept.
             quiet: true
 
-        - name: Pre-pull the image into containerd (never reaches the manifest unless it pulls)
-          ansible.builtin.command:
-            argv: "{{ toe_crictl_cmd + ['pull', toe_image] }}"
-          register: toe_pull
-          changed_when: false  # a pull of a cached image is not a change; the manifest edit is
-          when: not ansible_check_mode
-
-        - name: Inspect the pulled image
-          ansible.builtin.command:
-            argv: "{{ toe_crictl_cmd + ['inspecti', '-o', 'json', toe_image] }}"
-          register: toe_inspect
-          changed_when: false
-          failed_when: not ansible_check_mode and toe_inspect.rc != 0  # in check mode the image is not pulled
-          check_mode: false
-
-        - name: The image in the cache carries the requested digest
-          ansible.builtin.assert:
-            that: toe_digest in toe_have
-            fail_msg: >-
-              The image in the containerd cache of {{ inventory_hostname }} does not carry the digest
-              {{ toe_image | regex_replace('^.*@', '') }} (repoDigests: {{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) }}).
-              The manifest was not changed.
-            quiet: true
-          vars:
-            toe_digest: "{{ toe_image | regex_replace('^.*@', '') }}"
-            toe_have: "{{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) | map('regex_replace', '^.*@', '') | list }}"
-          when: not ansible_check_mode or toe_inspect.rc == 0
+        - name: Pre-pull the image and check its digest (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-image-pull.yml
 
         - name: Back up the manifest, put the image on the toe container, wait for the rollout (shared with rebootstrap-device.yml)
           ansible.builtin.import_tasks: tasks/toe-manifest-set-image.yml
@@ -384,6 +358,7 @@
           ansible.builtin.slurp:
             src: "{{ toe_restore_from }}"
           register: toe_bak_file
+          no_log: true  # the manifest holds Secrets (image pull secrets); only the toe container's regex groups are kept
 
         - name: Find the toe container in the backup
           ansible.builtin.set_fact:

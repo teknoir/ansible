@@ -74,12 +74,17 @@ unit_flag() { # flag
     }'
 }
 
-# the value that the drop-ins give (later file wins)
-dropin_value() { # key
+# the value that the drop-ins give (k3s reads them in alphabetical order, the later file wins). With a
+# second argument, the value as it would be with that file as the content of $DROPIN.
+dropin_value() { # key [candidate-file]
   _v=
-  for _f in "$CONFIG_DIR"/*.yaml "$CONFIG_DIR"/*.yml; do
-    [ -f "$_f" ] || continue
-    _x=$(yaml_key "$_f" "$1")
+  for _f in $({
+    for _g in "$CONFIG_DIR"/*.yaml "$CONFIG_DIR"/*.yml; do [ ! -f "$_g" ] || echo "$_g"; done
+    [ -z "${2:-}" ] || echo "$CONFIG_DIR/$DROPIN"
+  } | LC_ALL=C sort -u); do
+    _src=$_f
+    if [ -n "${2:-}" ] && [ "$_f" = "$CONFIG_DIR/$DROPIN" ]; then _src=$2; fi
+    _x=$(yaml_key "$_src" "$1")
     [ -z "$_x" ] || _v=$_x
   done
   printf '%s' "$_v"
@@ -122,15 +127,17 @@ if [ "$have" = 1 ]; then
     done
   } > "$tmp"
   chmod 0644 "$tmp"
-  mv -f "$tmp" "$CONFIG_DIR/$DROPIN"
-  # A later drop-in with another value would still win after the reinstall.
+  # A later drop-in with another value would still win after the reinstall. Check before the file goes
+  # into place: a refusal must not change the device.
   for k in $KEYS; do
     eval "v=\$eff_$(echo "$k" | tr - _)"
-    if [ -n "$v" ] && [ "$(dropin_value "$k")" != "$v" ]; then
-      echo "tn-k3s-networks: refused, $k=$v is overridden by another file in $CONFIG_DIR after $DROPIN; the reinstall would change it" >&2
+    if [ -n "$v" ] && [ "$(dropin_value "$k" "$tmp")" != "$v" ]; then
+      rm -f "$tmp"
+      echo "tn-k3s-networks: refused, $k=$v would be overridden by another file in $CONFIG_DIR after $DROPIN; the reinstall would change it. Nothing was written." >&2
       exit 6
     fi
   done
+  mv -f "$tmp" "$CONFIG_DIR/$DROPIN"
   echo "tn-k3s-networks: changed, wrote $CONFIG_DIR/$DROPIN:$summary"
   exit 0
 fi
