@@ -31,13 +31,8 @@
 
 # The pin first: if k3s applies the file between the two edits, the pod that results is the old image on the
 # server node, never the new image on an unpinned pod.
-- name: Pin the TOE pod to the server node (one nodeSelector line after priorityClassName)
-  ansible.builtin.replace:
-    path: "{{ toe_manifest }}"
-    regexp: '{{ toe_pin_insert_re }}'
-    replace: '{{ toe_pin_insert }}'
-  diff: false  # the manifest holds Secrets: --diff must not print it
-  when: (toe_pin_server | bool) and toe_pod_state == 'absent'
+- name: Pin the TOE pod to the server node (shared with the rollback)
+  ansible.builtin.import_tasks: toe-manifest-pin.yml
 
 - name: Replace the image and imagePullPolicy of the toe container only
   ansible.builtin.replace:
@@ -57,28 +52,5 @@
   changed_when: false
   when: not ansible_check_mode
 
-- name: Wait for the Deployment to carry the nodeSelector (also when the image did not change)
-  ansible.builtin.command:
-    argv: "{{ toe_kubectl_cmd + toe_get_pin_argv }}"
-  register: toe_cur_pin
-  until: toe_cur_pin.stdout == 'true'
-  retries: "{{ (toe_wait_timeout | int / 5) | int }}"
-  delay: 5
-  changed_when: false
-  when: (toe_pin_server | bool) and not ansible_check_mode
-
-- name: Wait for the rollout
-  ansible.builtin.command:
-    argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
-  changed_when: false
-  when: not ansible_check_mode
-
-- name: The TOE pod runs on the server node (and only there)
-  ansible.builtin.command:
-    argv: "{{ toe_kubectl_cmd + toe_get_pod_nodes_argv }}"
-  register: toe_pod_nodes
-  until: (toe_pod_nodes.stdout_lines | length) > 0 and (toe_pod_nodes.stdout_lines | unique | list) == [toe_pin_node]
-  retries: "{{ (toe_wait_timeout | int / 5) | int }}"
-  delay: 5
-  changed_when: false
-  when: (toe_pin_server | bool) and not ansible_check_mode
+- name: Wait for the nodeSelector, the rollout and the TOE pod on the server node
+  ansible.builtin.import_tasks: toe-manifest-wait.yml

@@ -7,12 +7,13 @@
 #     the keys of the node it runs on, so there must be exactly one place it can go).
 # Sets toe_pin_node (the node name, without the `node/` prefix) and toe_pin_needed (the selector is to be added or
 # the manifest cannot be understood). Read-only commands only (they run in --check mode too). Needs the vars of
-# playbooks/vars/toe-manifest.yml and toe-manifest-read.yml run before; the caller sets become.
+# playbooks/vars/toe-manifest.yml and toe-manifest-read.yml run before (on toe_read_src when that is set: a rollback checks
+# the backup it is about to restore); the caller sets become.
 - name: Refuse a manifest where the toe pod spec is not found exactly once
   ansible.builtin.assert:
     that: toe_pod_count | int == 1
     fail_msg: >-
-      {{ toe_manifest }}: expected exactly one TOE pod spec (Deployment kube-system/toe with `priorityClassName:
+      {{ toe_read_src | default(toe_manifest) }}: expected exactly one TOE pod spec (Deployment kube-system/toe with `priorityClassName:
       high-priority-toe` and the toe container), found {{ toe_pod_count }}. Nothing was changed. To leave the pod
       template alone pass -e toe_pin_server=false.
     quiet: true
@@ -22,7 +23,7 @@
   ansible.builtin.assert:
     that: toe_pod_state in ['absent', 'present']
     fail_msg: >-
-      {{ toe_manifest }}: the TOE pod spec has a nodeSelector that is not `{{ toe_pin_line }}` alone
+      {{ toe_read_src | default(toe_manifest) }}: the TOE pod spec has a nodeSelector that is not `{{ toe_pin_line }}` alone
       (or one that is not directly under `priorityClassName: high-priority-toe`). It is not merged. Nothing was
       changed. Fix it by hand or pass -e toe_pin_server=false.
     quiet: true

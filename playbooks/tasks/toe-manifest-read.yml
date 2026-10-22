@@ -6,13 +6,13 @@
 # (Deployment kube-system/toe with the priorityClassName line and the toe container: exactly one on a Teknoir device)
 # and the state of its nodeSelector: absent, present (the pin to the server node), conflict (another nodeSelector), none
 # (the pod spec was not found exactly once). Needs toe_manifest and toe_re (playbooks/vars/toe-manifest.yml); the caller sets
-# become.
+# become. toe_read_src (default toe_manifest) names another file to read instead, e.g. the backup a rollback restores.
 #
 # The manifest holds Secrets (the image pull secrets), so the slurp has no_log and nothing but the regex
 # groups of the toe container is kept: the file content must never reach the output, whatever the verbosity.
 - name: Is the TOE manifest there
   ansible.builtin.stat:
-    path: "{{ toe_manifest }}"
+    path: "{{ toe_read_src | default(toe_manifest) }}"
   register: toe_manifest_stat
 
 - name: Refuse a missing TOE manifest
@@ -24,7 +24,7 @@
 
 - name: Read the TOE manifest
   ansible.builtin.slurp:
-    src: "{{ toe_manifest }}"
+    src: "{{ toe_read_src | default(toe_manifest) }}"
   register: toe_file
   no_log: true  # the manifest holds Secrets
   when: toe_manifest_stat.stat.exists

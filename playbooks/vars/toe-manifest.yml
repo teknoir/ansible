@@ -35,5 +35,10 @@ toe_pin_insert_re: '(?m)^([ ]+)(priorityClassName: high-priority-toe\n)(?=(?:(?!
 toe_pin_insert: '\g<1>\g<2>\g<1>nodeSelector:\n\g<1>  node-role.kubernetes.io/control-plane: "true"\n'
 toe_get_pin_argv: "{{ ['-n', toe_namespace, 'get', 'deploy', toe_deployment, '-o', 'jsonpath=' ~ toe_jsonpath_pin] }}"
 toe_jsonpath_pin: '{.spec.template.spec.nodeSelector.node-role\.kubernetes\.io/control-plane}'
-toe_get_pod_nodes_argv: "{{ ['-n', toe_namespace, 'get', 'pods', '-l', 'app=toe', '-o', 'jsonpath=' ~ toe_jsonpath_pod_nodes] }}"
-toe_jsonpath_pod_nodes: '{range .items[*]}{.spec.nodeName}{"\n"}{end}'
+# Live TOE pods only: the field selector drops Failed and Succeeded pods (Evicted, NodeAffinity,
+# UnexpectedAdmissionError ... left behind by an earlier ReplicaSet), deletionTimestamp is not selectable, so each
+# line is `<node>|<deletionTimestamp>` and a pod that is being deleted (non-empty timestamp) is ignored in toe_live_pod_nodes.
+toe_get_pod_nodes_argv: "{{ ['-n', toe_namespace, 'get', 'pods', '-l', 'app=toe', '--field-selector=status.phase!=Failed,status.phase!=Succeeded', '-o', 'jsonpath=' ~ toe_jsonpath_pod_nodes] }}"
+toe_jsonpath_pod_nodes: '{range .items[*]}{.spec.nodeName}{"|"}{.metadata.deletionTimestamp}{"\n"}{end}'
+# the nodes of the live pods, from the registered toe_pod_nodes (toe-manifest-wait.yml)
+toe_live_pod_nodes: "{{ toe_pod_nodes.stdout_lines | select('match', '^[^|]*[|]$') | map('regex_replace', '[|]$', '') | unique | list }}"

@@ -19,7 +19,7 @@ img=$(awk '/- \/manager/{f=1;next} f&&/image:/{print $2;exit}' "$TOE_MANIFEST")
 case "$*" in
   *"get nodes"*) for n in ${TOE_NODES-orin}; do echo "node/$n"; done;;
   *"get deploy"*"nodeSelector"*) grep -q 'node-role.kubernetes.io/control-plane: "true"' "$TOE_MANIFEST" && printf true;;
-  *"get pods"*'}{.spec.nodeName}{'*) for n in ${TOE_POD_NODE-orin}; do echo "$n"; done;;
+  *"get pods"*'}{.spec.nodeName}{'*) for n in ${TOE_POD_NODE-orin}; do echo "$n|"; done;;
   *"get deploy"*) printf '%s' "$img";;
   *"rollout status"*) case "$img" in *badroll*) echo "timed out" >&2; exit 1;; esac; echo "deployment successfully rolled out";;
 esac

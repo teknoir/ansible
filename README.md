@@ -206,14 +206,16 @@ device: `--limit all`, wildcards and patterns that match several devices are ref
    restart loop. The pin comes first, the image second, so a manifest applied between the two edits never has the new
    image unpinned;
 6. waits until the Deployment carries the new image and the nodeSelector, `rollout status` is done (`toe_wait_timeout`,
-   default 300 s), and asserts that the TOE pod runs on the server node (and only there);
+   default 300 s), and asserts that the live TOE pods run on the server node (and only there). Pods that are Failed or
+   Succeeded (Evicted, NodeAffinity, UnexpectedAdmissionError left behind by an earlier ReplicaSet) and pods being
+   deleted are ignored;
 7. on any failure: restores the backup, waits for the old TOE to be Ready, and fails the run;
 8. prints the TOE pod, its node, image, `imageID` and restarts.
 
 A second run with the same image changes nothing (no new backup). `rebootstrap-device.yml` uses the same shared tasks: the
 templates write the pod spec without the nodeSelector, so its restore of a digest-pinned TOE image puts the pin back too
-(and does so when only the pin is missing). Roll back with `toe_rollback=true`: it restores a backup, which has no
-selector if it predates this change. `-e toe_pin_server=false` leaves the pod template alone (an existing `nodeSelector`
+(and does so when only the pin is missing). Roll back with `toe_rollback=true`: it restores a backup and, because a backup that predates the pin has no
+selector, pins the pod again (after the same pre-flight check on the backup, before anything is changed). `-e toe_pin_server=false` leaves the pod template alone (an existing `nodeSelector`
 is never removed), for example on a robot with several server nodes, which the pin refuses (exactly one labelled node is
 required). Variables: `toe_image`, `toe_rollback`, `toe_backup`,
 `toe_wait_timeout`, `toe_allow_prune`, `toe_allow_changes`, `toe_allow_many`, `toe_pin_server`; the paths and commands (`toe_manifest`, `toe_backup_dir`, `toe_kubectl_cmd`, `toe_crictl_cmd`,
@@ -234,8 +236,9 @@ errors, a namespace created by the same config, `toe_allow_changes`, items sent 
 values printed), a successful rollout, idempotence, a failing rollout that is restored, and rollback. The pin tests cover a
 fresh manifest, an idempotent re-run, an unchanged image that still gets the selector (and is checked like any roll), a
 pod spec that is not found exactly once or has another nodeSelector, no or two nodes with the control-plane label, the
-TOE pod on another node after the rollout (restored), `toe_pin_server=false`, and that the manifest Secret is never
-printed. `tests/toe-keep/run.sh` covers the pin in the re-bootstrap restore.
+TOE pod on another node after the rollout (restored), a Failed or terminating TOE pod left on another node (ignored), the rollback that pins again (and its refusal
+on a robot with two labelled nodes), `toe_pin_server=false`, the manifest of the cli bootstrap template (recognised as
+already pinned, `tests/toe-image/cli-server.teknoir.yaml`), and that the manifest Secret is never printed. `tests/toe-keep/run.sh` covers the pin in the re-bootstrap restore.
 
 ## Node roles
 A node role is a set of k3s node labels (and optional taints), so workloads can be assigned to the nodes that fill

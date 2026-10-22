@@ -18,7 +18,7 @@
 #     node of the robot (another computer, other keys) EMQX refuses it (reason 135) and TOE restart-loops, the robot
 #     goes offline. Before anything is changed it checks that the pod spec is found exactly once (and has no other
 #     nodeSelector) and that `kubectl get nodes -l node-role.kubernetes.io/control-plane=true` returns exactly one
-#     node; after the rollout it asserts that the TOE pod runs on that node. This also happens when the image is
+#     node; after the rollout it asserts that every live TOE pod (not Failed or Succeeded, not being deleted) runs on that node. This also happens when the image is
 #     the one the device already has (the run then only adds the selector and rolls the Deployment; the pre-flight
 #     checks below apply to such a run, only a run that changes nothing skips them). -e toe_pin_server=false
 #     leaves the pod template alone,
@@ -43,7 +43,9 @@
 #   # Only look: prints the plan and the diff of the manifest, changes nothing (no pull, no restart)
 #   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 --check --diff -e toe_image=...
 #
-#   # Roll back: restore the newest backup (or -e toe_backup=<path>), wait for the TOE to be Ready
+#   # Roll back: restore the newest backup (or -e toe_backup=<path>), pin the TOE pod to the server node again (a
+#   # backup made before the pin has no nodeSelector; same pre-flight check as a rollout; -e toe_pin_server=false
+#   # restores the backup as it is), wait for the TOE to be Ready
 #   tnctl ansible-playbook playbooks/toe-image.yml --limit vm-fresh-01 -e toe_rollback=true
 #
 # Variables
@@ -395,11 +397,27 @@
             fail_msg: "{{ toe_restore_from }} does not look like the Teknoir manifest. Nothing was changed."
             quiet: true
 
+        # A backup made before the pin has no nodeSelector, and restoring it would bring the TOE back onto an agent
+        # node of a multi-node robot. So the backup gets the same pre-flight check as a rollout (pod spec found
+        # exactly once, no other nodeSelector, exactly one node with the control-plane label), before anything is
+        # changed, and the pin is applied after the restore. -e toe_pin_server=false restores the backup as it is.
+        - name: Which pod spec and nodeSelector the backup has (the manifest tasks read the backup, not the manifest)
+          ansible.builtin.set_fact:
+            toe_read_src: "{{ toe_restore_from }}"
+
+        - name: Read the backup's toe pod spec (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-manifest-read.yml
+
+        - name: Check that the TOE pod can be pinned to the server node after the restore (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-pin-check.yml
+
         - name: Plan
           ansible.builtin.debug:
             msg: >-
               {{ inventory_hostname }}: restore {{ toe_restore_from }}
-              (image {{ toe_bak_found[0][1] }}) over {{ toe_manifest }} (image {{ toe_old_image }})
+              (image {{ toe_bak_found[0][1] }}) over {{ toe_manifest }} (image {{ toe_old_image }}){{
+              ('; nodeSelector ' ~ toe_pin_line ~ (' already in the backup' if toe_pod_state == 'present' else ' to be added after the restore')
+              ~ ', the TOE runs on node ' ~ toe_pin_node) if toe_pin_server | bool else '; no nodeSelector added (toe_pin_server=false)' }}
 
         - name: Keep the manifest that is being replaced
           ansible.builtin.copy:
@@ -417,6 +435,9 @@
             mode: preserve
           diff: false  # the manifest holds Secrets: --diff must not print it
 
+        - name: Pin the TOE pod to the server node again (the backup has no nodeSelector; shared with the rollout)
+          ansible.builtin.import_tasks: tasks/toe-manifest-pin.yml
+
         - name: Wait for the Deployment to carry the restored image
           ansible.builtin.command:
             argv: "{{ toe_kubectl_cmd + toe_get_image_argv }}"
@@ -429,11 +450,8 @@
           changed_when: false
           when: not ansible_check_mode
 
-        - name: Wait for the rollout
-          ansible.builtin.command:
-            argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
-          changed_when: false
-          when: not ansible_check_mode
+        - name: Wait for the nodeSelector, the rollout and the TOE pod on the server node
+          ansible.builtin.import_tasks: tasks/toe-manifest-wait.yml
 
     # ------------------------------------------------------------------ report
     - name: Read the TOE pod
