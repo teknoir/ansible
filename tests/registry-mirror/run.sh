@@ -14,7 +14,11 @@ trap '[ -n "${KEEP:-}" ] && echo "kept $work" || rm -rf "${work:?}"' EXIT
 mkdir -p "$work/bin" "$work/etc" "$work/state"
 export ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_HOST_KEY_CHECKING=False
 S="$work/state"
-REG="$work/etc/registries.yaml" B="$work/backups" HT="$work/etc/hosts.toml" CFG="$work/etc/config.yaml"
+# containerd's hosts.toml lives under k3s's data directory; the default data directory is a throwaway one
+# (-e registry_default_data_dir), custom ones are made per test (config.yaml, config.yaml.d, unit --data-dir)
+DD="$work/k3s" HTREL=agent/etc/containerd/certs.d/docker.io/hosts.toml
+mkdir -p "$DD/agent/etc/containerd/certs.d/docker.io"
+REG="$work/etc/registries.yaml" B="$work/backups" HT="$DD/$HTREL" CFG="$work/etc/config.yaml"
 export STUB_STATE="$S" STUB_REG="$REG" STUB_HT="$HT"
 PASS='StubRobotPassw0rdFORtest'
 PASS2='RotatedRobotPassw0rd2FORtest'
@@ -65,6 +69,12 @@ cat > "$work/bin/crictl" <<'S'
 #!/bin/sh
 echo "$*" >> "$STUB_STATE/crictl.log"
 case "$1" in
+  images)
+    # -q: the image IDs; -q <ref>: the ID of that image when the device has it (only the proof image is tracked)
+    if [ -n "$3" ]; then grep -qx 'sha256:proof' "$STUB_STATE/images" 2>/dev/null && echo sha256:proof
+    else cat "$STUB_STATE/images" 2>/dev/null; fi; exit 0;;
+  rmi) echo "$2" >> "$STUB_STATE/rmi.log"; [ -f "$STUB_STATE/rmifail" ] && { echo "rmi failed" >&2; exit 1; }
+    grep -vx "$2" "$STUB_STATE/images" > "$STUB_STATE/images.new" 2>/dev/null; mv "$STUB_STATE/images.new" "$STUB_STATE/images"; exit 0;;
   pull) [ -f "$STUB_STATE/pullfail" ] && { echo "pull failed: 403" >&2; exit 1; }
     case "$2" in
       ghcr.io/*)
@@ -72,7 +82,8 @@ case "$1" in
         # (registries.yaml with the Harbor endpoint and a credential, not "proofdeny" = a stale credential)
         if [ -f "$STUB_STATE/proofdeny" ] || ! grep -q 'password:' "$STUB_REG" 2>/dev/null || ! grep -q '"ghcr/\$1"' "$STUB_REG" 2>/dev/null; then
           echo "pull failed: ghcr.io 403 (denied, mirror not used)" >&2; exit 1
-        fi;;
+        fi
+        grep -qx 'sha256:proof' "$STUB_STATE/images" 2>/dev/null || echo sha256:proof >> "$STUB_STATE/images";;
     esac
     echo "Image is up to date";;
   info) echo '{"status":{"conditions":[{"type":"RuntimeReady","status":true},{"type":"NetworkReady","status":true}]}}';;
@@ -106,7 +117,7 @@ unit_agent() { printf 'LoadState=loaded\nKillMode=process\nExecStart={ path=/usr
 unit_server
 
 run() { ( cd "$repo" && ansible-playbook -i localhost, -c local --limit localhost playbooks/registry-mirror.yml \
-  -e registry_use_become=false -e registry_file_owner= -e registry_file="$REG" -e registry_backup_dir="$B" -e registry_hosts_toml="$HT" \
+  -e registry_use_become=false -e registry_file_owner= -e registry_file="$REG" -e registry_backup_dir="$B" -e registry_default_data_dir="$DD" \
   -e registry_config_yaml="$CFG" -e registry_wait_timeout=10 \
   -e registry_kube_context=vpro -e ansible_teknoir_namespace=teknoir-demo -e ansible_teknoir_domain=test.example \
   -e "{\"registry_local_kubectl_cmd\":[\"$work/bin/kubectl\"],\"registry_kubectl_cmd\":[\"$work/bin/kubectl\"],\"registry_crictl_cmd\":[\"$work/bin/crictl\"],\"registry_curl_cmd\":[\"$work/bin/curl\"],\"registry_systemctl_cmd\":[\"$work/bin/systemctl\"],\"registry_hostname_cmd\":[\"$work/bin/hostname\"]}" \
@@ -118,7 +129,7 @@ fail=0
 ok() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=1; fi; }
 restarts() { [ -f "$S/restarts.log" ] && wc -l < "$S/restarts.log" || echo 0; }
 nbak() { ls "$B" 2>/dev/null | grep -c . ; }
-reset() { rm -rf "$REG" "$B" "$HT" "$S"/restarts.log "$S"/*.log "$S"/nocred "$S"/tlsfail "$S"/head403 "$S"/pullfail "$S"/restart-fail-once "$S"/hosts-noregen "$S"/proofdeny "$S"/node-notready; : > "$S/kubectl.log"; unit_server; }
+reset() { rm -rf "$REG" "$B" "$HT" "$S"/restarts.log "$S"/*.log "$S"/nocred "$S"/tlsfail "$S"/head403 "$S"/pullfail "$S"/restart-fail-once "$S"/hosts-noregen "$S"/proofdeny "$S"/node-notready "$S"/images "$S"/rmifail; rm -rf "$CFG" "$CFG.d" "$work"/dd-*/$HTREL; export STUB_HT="$HT"; : > "$S/kubectl.log"; unit_server; }
 HOST=harbor.test.example
 
 # ---- argument guards
@@ -285,6 +296,44 @@ o=$(go); ok "server: the node name comes from config.yaml" "echo \"\$o\" | grep 
 reset; rm -f "$CFG"
 o=$(go -e registry_node_name=custom-node); ok "server: registry_node_name overrides it" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'get node custom-node' $S/kubectl.log"
 rm -f "$CFG"
+
+# ---- the proof image does not stay on the device unless it was there before
+reset
+o=$(go); ok "proof image: pulled for the proof and removed again when the device did not have it" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^pull ghcr.io/teknoir/observatory-event-processing-app:latest' $S/crictl.log && grep -qx 'rmi sha256:proof' <(grep '^rmi' $S/crictl.log) && ! grep -qx 'sha256:proof' $S/images"
+reset; echo sha256:proof > "$S/images"
+o=$(go); ok "proof image: kept when the device had it before (no rmi)" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^pull ghcr.io/teknoir/observatory' $S/crictl.log && ! grep -q '^rmi' $S/crictl.log && grep -qx 'sha256:proof' $S/images"
+reset; touch "$S/rmifail"
+o=$(go); ok "proof image: a failed rmi does not fail the run or roll back" "echo \"\$o\" | grep -q 'failed=0' && [ -f $REG ] && [ \$(restarts) = 1 ] && grep -q '^rmi' $S/crictl.log"
+reset
+o=$(go -e registry_proof_image=ghcr.io/teknoir/other:1); ok "proof image: a registry_proof_image override is tracked the same way" "echo \"\$o\" | grep -q 'failed=0' && grep -q '^rmi sha256:proof' $S/crictl.log"
+
+# ---- k3s data directory: default, config.yaml, drop-ins (later wins), the unit's --data-dir, and a missing agent dir
+dd_dir() { mkdir -p "$1/agent/etc/containerd/certs.d/docker.io"; }
+dd_dir "$work/dd-cfg"; dd_dir "$work/dd-a"; dd_dir "$work/dd-b"; dd_dir "$work/dd-cli"
+reset
+o=$(go); ok "data-dir default: hosts.toml is read under the default data directory" "echo \"\$o\" | grep -q 'failed=0' && [ -f $DD/$HTREL ]"
+reset; printf 'write-kubeconfig-mode: "0644"\ndata-dir: %s\n' "$work/dd-cfg" > "$CFG"; export STUB_HT="$work/dd-cfg/$HTREL"
+o=$(go); ok "data-dir from config.yaml: hosts.toml is read there" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cfg/$HTREL ] && [ ! -e $DD/$HTREL ]"
+reset; printf 'data-dir: "%s"\n' "$work/dd-cfg" > "$CFG"; mkdir -p "$CFG.d"
+printf 'data-dir: %s\n' "$work/dd-a" > "$CFG.d/10-a.yaml"; printf "data-dir: '%s'\n" "$work/dd-b" > "$CFG.d/20-b.yml"; printf 'data-dir: /nonexistent\n' > "$CFG.d/30-ignored.txt"
+export STUB_HT="$work/dd-b/$HTREL"
+o=$(go); ok "data-dir drop-ins: the last file in name order overrides config.yaml and earlier drop-ins (and a .txt is ignored)" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-b/$HTREL ] && [ ! -e $work/dd-a/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ] && [ ! -e $DD/$HTREL ]"
+reset; printf 'data-dir: %s\n' "$work/dd-cfg" > "$CFG"; unit_server process "--data-dir $work/dd-cli --other"; export STUB_HT="$work/dd-cli/$HTREL"
+o=$(go); ok "data-dir from the unit's ExecStart wins over config.yaml" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ] && [ ! -e $work/dd-cfg/$HTREL ]"
+reset; unit_server process "-d=$work/dd-cli"; export STUB_HT="$work/dd-cli/$HTREL"
+o=$(go); ok "data-dir from the unit's -d=<dir>" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-cli/$HTREL ]"
+reset; export STUB_HT="$work/dd-a/$HTREL"
+o=$(go -e registry_data_dir="$work/dd-a"); ok "-e registry_data_dir overrides the search" "echo \"\$o\" | grep -q 'failed=0' && [ -f $work/dd-a/$HTREL ]"
+reset; printf 'data-dir: %s\n' "$work/missing" > "$CFG"
+o=$(go); ok "data-dir without an agent dir is refused before any change (no file, no backup, no restart, no probe, no credential)" "echo \"\$o\" | grep -q 'has no agent directory' && echo \"\$o\" | grep -q 'failed=1' && [ ! -e $REG ] && [ ! -d $B ] && [ \$(restarts) = 0 ] && [ ! -s $S/curl.log ] && ! grep -q 'get secret' $S/kubectl.log && [ ! -e $S/crictl.log ]"
+reset; printf 'data-dir: relative/dir\n' > "$CFG"
+o=$(go); ok "a relative data-dir is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ \$(restarts) = 0 ]"
+reset
+o=$(go -e registry_default_data_dir="$work/nope"); ok "a missing default data directory is refused before any change" "echo \"\$o\" | grep -q 'has no agent directory' && [ ! -e $REG ] && [ \$(restarts) = 0 ]"
+reset; mkdir -p "$B"; chmod 700 "$B"; printf '# managed by teknoir\n# prev\nmirrors: {}\n' > "$B/registries.yaml.bak-20260101T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true -e registry_default_data_dir="$work/nope"); ok "rollback does not need the data directory" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'prev' $REG"
+reset; export STUB_HT="$HT"
 
 # ---- an agent: no apiserver to ask
 reset; unit_agent

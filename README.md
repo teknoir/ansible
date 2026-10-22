@@ -264,7 +264,10 @@ device (`all`, wildcards and patterns that match several are refused unless `-e 
 1. **pre-flight** on the device: a `k3s` or `k3s-agent` unit, not Docker mode, `KillMode=process` (a k3s restart then
    leaves the pods running; with any other KillMode it would stop them, so the run is refused), and a `registries.yaml`
    whose first line is not `# managed by teknoir` (or `# managed by tnctl bootstrap`) belongs to the device owner and
-   is refused unless `-e registry_allow_replace=true`;
+   is refused unless `-e registry_allow_replace=true`; k3s's data directory is found (the unit's `--data-dir`, else
+   `data-dir` in `/etc/rancher/k3s/config.yaml` and `config.yaml.d/*.yaml`, a later drop-in winning, else
+   `/var/lib/rancher/k3s`; `-e registry_data_dir=<dir>` skips the search) and the run is refused, nothing changed, when
+   `<data-dir>/agent` does not exist (a robot bootstrapped with a custom data-dir keeps containerd's `hosts.toml` there);
 2. **credential**, read on the controller with `no_log`: Secret `teknoir-system/harbor-teamspace-pull` of the kube
    context `registry_kube_context`, keys `<ansible_teknoir_namespace>.username` and `.password` (only those two keys are
    fetched; harbor-config creates the robot of every teamspace). The context is required and never defaulted; a
@@ -286,7 +289,8 @@ device (`all`, wildcards and patterns that match several are refused unless `-e 
    works, and then a pull of a small **private** image (`registry_proof_image`, default
    `ghcr.io/teknoir/observatory-event-processing-app:latest`, ~100 MB, amd64 and arm64). The public probe also passes
    through the upstream fallback; the private image is refused there (403), so its pull proves that containerd used
-   Harbor with the credential and the rewrite;
+   Harbor with the credential and the rewrite. The proof image is removed again (`crictl rmi`, by image ID) unless the
+   device had it before the pull, so ~100 MB does not stay on a small robot; a failed removal does not fail the run;
 9. **on any failure after step 6**: restores the backup (or removes the file), restarts k3s, waits, then fails.
 
 `-e registry_rollback=true` restores the newest backup by the timestamp in its name, `bak` or `absent` alike (the file it replaces is kept as `registries.yaml.pre-rollback-<UTC>`),
@@ -297,8 +301,17 @@ Variables: `registry_kube_context` (required unless rolling back), `registry_hos
 `harbor.<ansible_teknoir_domain>`), `registry_rollback`, `registry_rollback_to`, `registry_backup`, `registry_allow_replace`,
 `registry_allow_many`, `registry_proof_image`, `registry_wait_timeout` (300), `registry_node_name` (default: `node-name` of
 `/etc/rancher/k3s/config.yaml`, else the host name); the paths and commands (`registry_file`, `registry_file_owner`,
-`registry_backup_dir`, `registry_hosts_toml`, `registry_config_yaml`, `registry_*_cmd`, `registry_use_become`) default to a
+`registry_backup_dir`, `registry_data_dir`, `registry_hosts_toml` (default `<data-dir>/agent/etc/containerd/certs.d/docker.io/hosts.toml`), `registry_config_yaml`, `registry_*_cmd`, `registry_use_become`) default to a
 Teknoir device.
+
+**Credential rotation.** harbor-config (platform chart `harbor`) writes a new password for a teamspace's robot
+`robot$ts-<teamspace>` when its key is missing from `harbor-teamspace-pull` or Harbor answers 401/403 for the stored
+one, and deleting the keys rotates it on purpose. Every robot of that teamspace then holds a stale password in its
+`registries.yaml`: Harbor answers 401, containerd falls through to the upstream, public images keep working and private
+`ghcr.io/teknoir/*` images stop pulling. **After a rotation re-run this playbook on every robot of that teamspace**, one
+`--limit` at a time (the changed credential is written, k3s restarted, the mirror proven again); nothing does it
+automatically yet. Proposed, not built: an alert on failed Harbor logins by `robot$ts-*` (harbor-core access log or the
+gateway's 401s on `harbor.<domain>/service/token`, per robot name) so a stale robot shows up before a pull fails.
 
 Order: a VM device first, then real devices one at a time (check TOE Ready, no new restarts and unchanged pod start
 times before the next). Production devices only with the usual production OK. The agent nodes of multi-node robots
@@ -310,9 +323,11 @@ about two minutes):
 tests/registry-mirror/run.sh
 ```
 It covers the guards (`--limit`, kube context), the pre-flight (KillMode, Docker mode, no k3s, a foreign file, a file
-from `tnctl bootstrap`), a fresh install, a no-op re-run, `--check --diff`, a rotated credential, rollback (newest,
+from `tnctl bootstrap`, the k3s data directory: default, `config.yaml`, drop-ins, the unit's `--data-dir`, a missing
+`agent` directory refused before any change), a fresh install, a no-op re-run, `--check --diff`, a rotated credential, rollback (newest,
 named, absent-marker, no backup), probe failures (TLS, no credential, refused credential, manifest not served: nothing
-changed), failures after the write (probe pull, restart, `hosts.toml`, node not Ready: restored), the node name, an
+changed), the proof image (removed again, kept when it was there before, a failed `rmi`),
+failures after the write (probe pull, restart, `hosts.toml`, node not Ready: restored), the node name, an
 agent, and that the password, the token and the robot secret appear in no output, also with `-vvv`.
 
 ## Node roles
