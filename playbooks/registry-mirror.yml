@@ -15,7 +15,8 @@
 #   3. probes Harbor FROM THE DEVICE before anything is changed: https://<host>/v2/ answers 401 with a valid TLS chain,
 #      then a token for repository:dockerhub/rancher/mirrored-pause:pull and a HEAD of that manifest answer 200. The
 #      credential goes to curl on stdin (a curl config), never in an argument list. A failed probe stops the run,
-#   4. prints a redacted --diff of registries.yaml (the password shows as ********),
+#   4. prints a redacted --diff of registries.yaml (password/auth/identity_token/token values show as ********; a file
+#      of the device owner, with registry_allow_replace=true, is not printed at all),
 #   5. backs the current file up to registry_backup_dir (registries.yaml.bak-<UTC>, or registries.yaml.absent-<UTC>
 #      when there was none), outside the k3s directories,
 #   6. writes the file (root, 0600),
@@ -108,8 +109,9 @@
     registry_host_re: '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$'
     # What a credential may contain: it goes into a YAML file and a curl config. A Harbor robot is robot$name.
     registry_cred_re: '^[A-Za-z0-9$_.~+=@%:/-]+$'
-    # The password line of registries.yaml, for the redacted copies.
-    registry_redact_re: '(?m)^(\s*password:\s*).*$'
+    # The lines of registries.yaml that carry a credential (password, auth = base64 user:pass, identity_token, token),
+    # for the redacted copies. A key with a nested mapping (our own `auth:` header) has no value and is left alone.
+    registry_redact_re: '(?mi)^([ \t]*["'']?(?:password|passwd|auth|identity_?token|token)["'']?[ \t]*:[ \t]*)(?=\S).*$'
     registry_redact_to: '\1"********"'
     registry_accept: "application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
   become: "{{ registry_use_become | bool }}"
@@ -238,7 +240,9 @@
           ansible.builtin.set_fact:
             registry_restore_from: >-
               {{ registry_backup if registry_backup != '' else
-              (registry_baks.files | sort(attribute='path') | map(attribute='path') | list | last | default('')) }}
+              (registry_baks.files | map(attribute='path')
+              | map('regex_replace', '^(.*)/registries\.yaml\.(bak|absent)-([^/]*)$', '\3 \1/registries.yaml.\2-\3')
+              | sort | list | last | default('') | regex_replace('^[^ ]* ', '')) }}
 
         - name: Refuse without a backup
           ansible.builtin.assert:
@@ -416,7 +420,11 @@
           no_log: true
           ansible.builtin.set_fact:
             registry_changed: "{{ registry_cur_text != registry_new_text }}"
-            registry_cur_redacted: "{{ registry_cur_text | regex_replace(registry_redact_re, registry_redact_to) }}"
+            # A file that is not ours (registry_allow_replace=true) is the owner's: regexes cannot know every place a
+            # credential can sit in it (flow style, anchors, other keys), so its content is never printed.
+            registry_cur_redacted: >-
+              {{ (registry_cur_text | regex_replace(registry_redact_re, registry_redact_to)) if registry_cur_ours | bool else
+              '# (' ~ (registry_cur_text.splitlines() | length) ~ ' lines of a registries.yaml that belongs to the device owner; not shown, the backup keeps it)' }}
             registry_new_redacted: "{{ registry_new_text | regex_replace(registry_redact_re, registry_redact_to) }}"
 
         - name: Plan

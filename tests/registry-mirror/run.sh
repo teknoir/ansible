@@ -191,12 +191,35 @@ reset
 o=$(go -e registry_rollback=true); ok "rollback without any backup is refused" "echo \"\$o\" | grep -q 'No backup in' && [ \$(restarts) = 0 ]"
 export STUB_PASS_B64=$(printf '%s' "$PASS" | base64 -w0) STUB_PASS="$PASS"
 
+# ---- rollback picks the newest backup by its timestamp, whatever its kind (absent-* sorts before bak-* by name)
+reset
+mkdir -p "$B"; chmod 700 "$B"
+printf '# managed by teknoir\n# older-bak\nmirrors: {}\n' > "$B/registries.yaml.bak-20260101T000000Z"
+: > "$B/registries.yaml.absent-20260201T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true); ok "rollback: a newer absent-marker wins over an older bak" "echo \"\$o\" | grep -q 'failed=0' && [ ! -e $REG ]"
+reset
+mkdir -p "$B"; chmod 700 "$B"
+: > "$B/registries.yaml.absent-20260101T000000Z"
+printf '# managed by teknoir\n# newer-bak\nmirrors: {}\n' > "$B/registries.yaml.bak-20260201T000000Z"
+printf '# managed by teknoir\n# current\nmirrors: {}\n' > "$REG"
+o=$(go -e registry_rollback=true); ok "rollback: a newer bak wins over an older absent-marker" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'newer-bak' $REG"
+
 # ---- a file that is not ours
 reset
 printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://mine.example"\n' > "$REG"; cp "$REG" "$work/foreign"
 o=$(go); ok "a foreign registries.yaml is refused and untouched" "echo \"\$o\" | grep -q 'belongs to the device owner' && cmp -s $REG $work/foreign && [ ! -d $B ] && [ \$(restarts) = 0 ] && [ ! -s $S/curl.log ]"
 o=$(go --check --diff); ok "a foreign registries.yaml is refused in --check too" "echo \"\$o\" | grep -q 'belongs to the device owner' && cmp -s $REG $work/foreign"
 o=$(go -e registry_allow_replace=true); ok "registry_allow_replace=true replaces it and keeps a backup" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'managed by teknoir' $REG && cmp -s \"\$(ls $B/registries.yaml.bak-* | head -1)\" $work/foreign && [ \$(restarts) = 1 ]"
+# --diff of an allowed replacement must not print the owner's credentials (auth, identity_token, token, password)
+reset
+FAUTH='Zm9yZWlnbjpmb3JlaWduLXNlY3JldA'; FIDT='ForeignIdentityTokenValue1'; FTOK='ForeignBearerTokenValue2'; FPW='ForeignPasswordValue3'
+printf 'mirrors:\n  docker.io:\n    endpoint:\n      - "https://mine.example"\nconfigs:\n  "mine.example":\n    auth:\n      username: "u"\n      password: "%s"\n      auth: "%s"\n      identity_token: "%s"\n    token: %s\n  "inline.example": {auth: {password: %s}}\n' "$FPW" "$FAUTH" "$FIDT" "$FTOK" "$FPW" > "$REG"; cp "$REG" "$work/foreign2"
+o=$(go -e registry_allow_replace=true --check --diff)
+ok "--check --diff of a foreign file shows none of the owner's credentials and not the file" "echo \"\$o\" | grep -q 'failed=0' && ! echo \"\$o\" | grep -q -e '$FAUTH' -e '$FIDT' -e '$FTOK' -e '$FPW' -e 'mine.example' && echo \"\$o\" | grep -q 'belongs to the device owner; not shown'"
+o=$(go -e registry_allow_replace=true --diff)
+ok "--diff of a foreign file replacement shows none of the owner's credentials either" "echo \"\$o\" | grep -q 'failed=0' && ! echo \"\$o\" | grep -q -e '$FAUTH' -e '$FIDT' -e '$FTOK' -e '$FPW' && cmp -s \"\$(ls $B/registries.yaml.bak-* | head -1)\" $work/foreign2"
+ok "the owner's credentials appear in no output of any run" "! grep -q -e '$FAUTH' -e '$FIDT' -e '$FTOK' -e '$FPW' $ALL"
 reset
 printf '# managed by tnctl bootstrap\nmirrors: {}\n' > "$REG"
 o=$(go); ok "a file written by tnctl bootstrap counts as ours" "echo \"\$o\" | grep -q 'failed=0' && grep -q 'managed by teknoir' $REG && ls $B | grep -q '^registries.yaml.bak-'"

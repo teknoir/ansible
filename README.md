@@ -273,8 +273,9 @@ device (`all`, wildcards and patterns that match several are refused unless `-e 
    token for `repository:dockerhub/rancher/mirrored-pause:pull` is issued for the credential and a `HEAD` of that
    manifest through Harbor answers `200`. The credential and the token go to curl on stdin (a curl config), never in an
    argument list. A failed probe stops the run with nothing changed;
-4. **redacted `--diff`** of `registries.yaml` (the password shows as `********`; when only the credential changes the
-   plan says so);
+4. **redacted `--diff`** of `registries.yaml` (password, auth, identity_token and token values show as `********`; when only the
+   credential changes the plan says so; with `registry_allow_replace=true` the device owner's file is never printed, only
+   its line count);
 5. **backup** to `/var/lib/rancher/k3s/registry-mirror-backups/registries.yaml.bak-<UTC>` (outside the k3s directories,
    `0600`), or `registries.yaml.absent-<UTC>` when the device had no file;
 6. **write** the file (root, `0600`; only when it differs);
@@ -288,7 +289,7 @@ device (`all`, wildcards and patterns that match several are refused unless `-e 
    Harbor with the credential and the rewrite;
 9. **on any failure after step 6**: restores the backup (or removes the file), restarts k3s, waits, then fails.
 
-`-e registry_rollback=true` restores the newest backup (the file it replaces is kept as `registries.yaml.pre-rollback-<UTC>`),
+`-e registry_rollback=true` restores the newest backup by the timestamp in its name, `bak` or `absent` alike (the file it replaces is kept as `registries.yaml.pre-rollback-<UTC>`),
 restarts k3s only if the file changes, and waits. `--check` stops after step 4. A second run changes nothing (no
 backup, no restart). The credential is never printed: not in the plan, the diff, the task output or `-vvv`.
 
