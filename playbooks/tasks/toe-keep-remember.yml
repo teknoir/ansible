@@ -1,0 +1,18 @@
+---
+# Before a re-bootstrap: remember the TOE image of the device when it is pinned by digest (@sha256:).
+# Sets tn_toe_keep (the image, or '' = nothing to keep). The bootstrap templates write the moving tag
+# docker.io/tekn0ir/toe:toe_v4 with imagePullPolicy Always. An unreadable manifest keeps nothing.
+# Needs the vars of playbooks/vars/toe-manifest.yml.
+- name: Remember a digest-pinned TOE image
+  become: true
+  block:
+    - name: Read the TOE image line of the manifest
+      ansible.builtin.import_tasks: toe-manifest-read.yml
+      vars:
+        toe_read_optional: true
+
+    - name: The TOE image to keep, if it is pinned by digest
+      ansible.builtin.set_fact:
+        tn_toe_keep: >-
+          {{ toe_found[0][1] if (toe_found | length == 1 and toe_found[0][1] is match('^\S+@sha256:[0-9a-f]{64}$'))
+          else '' }}

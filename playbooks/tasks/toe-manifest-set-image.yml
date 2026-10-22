@@ -1,0 +1,44 @@
+---
+# Put toe_image (registry/repo[:tag]@sha256:...) and imagePullPolicy IfNotPresent on the toe container of the
+# TOE manifest and wait for the Deployment to carry it. Backs the manifest up first, outside the manifests
+# directory (k3s would apply a backup inside it). Needs toe_image, toe_old_image and toe_old_policy (the
+# current image line), toe_wait_timeout, the vars of playbooks/vars/toe-manifest.yml, and sets toe_bak (the
+# caller's rescue restores it). Nothing is changed when the line already is as wanted. The caller sets become.
+- name: Make the backup directory (outside the manifests directory, so k3s does not apply backups)
+  ansible.builtin.file:
+    path: "{{ toe_backup_dir }}"
+    state: directory
+    mode: "0700"
+  when: toe_old_image != toe_image or toe_old_policy != 'IfNotPresent'
+
+- name: Back up the manifest
+  ansible.builtin.copy:
+    src: "{{ toe_manifest }}"
+    dest: "{{ toe_backup_dir }}/teknoir.yaml.bak-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    remote_src: true
+    mode: preserve
+  register: toe_bak
+  when: (toe_old_image != toe_image or toe_old_policy != 'IfNotPresent') and not ansible_check_mode
+
+- name: Replace the image and imagePullPolicy of the toe container only
+  ansible.builtin.replace:
+    path: "{{ toe_manifest }}"
+    regexp: '{{ toe_re }}'
+    replace: '\g<1>{{ toe_image }}\g<3>IfNotPresent'
+  register: toe_edit
+
+- name: Wait for the Deployment to carry the new image (k3s re-applies the file)
+  ansible.builtin.command:
+    argv: "{{ toe_kubectl_cmd + toe_get_image_argv }}"
+  register: toe_cur
+  until: toe_cur.stdout == toe_image
+  retries: "{{ (toe_wait_timeout | int / 5) | int }}"
+  delay: 5
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Wait for the rollout
+  ansible.builtin.command:
+    argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
+  changed_when: false
+  when: not ansible_check_mode

@@ -1,0 +1,14 @@
+---
+# Read the TOE manifest and find the toe container in it (the image line after `command: - /manager`).
+# Sets toe_found: a list with one [prefix, image, middle, policy] entry per toe container (exactly one on a
+# Teknoir device). With toe_read_optional=true an unreadable manifest gives an empty list instead of a failure.
+# Needs toe_manifest and toe_re (playbooks/vars/toe-manifest.yml); the caller sets become.
+- name: Read the TOE manifest
+  ansible.builtin.slurp:
+    src: "{{ toe_manifest }}"
+  register: toe_file
+  failed_when: toe_file.failed | default(false) and not (toe_read_optional | default(false) | bool)
+
+- name: Find the toe container in the manifest
+  ansible.builtin.set_fact:
+    toe_found: "{{ (toe_file.content | default('') | b64decode) | regex_findall(toe_re, multiline=True) }}"

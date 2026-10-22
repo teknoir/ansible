@@ -130,7 +130,13 @@ drop `--cluster-cidr`, `--service-cidr` and `--cluster-dns` given only on the in
 have: k3s then crash-loops on the podCIDR of the node): `files/tn-k3s-networks.sh` reads only those three keys from
 the unit and `config.yaml[.d]` and writes them to `/etc/rancher/k3s/config.yaml.d/10-k3s-networks.yaml` unless a
 drop-in already holds them, and the run stops if they cannot be determined while the node's podCIDR is outside
-10.42.0.0/16 (test: `tests/k3s-networks/run.sh`); copies the script root-only, runs it in the background
+10.42.0.0/16 (test: `tests/k3s-networks/run.sh`); remembers a TOE image that is pinned by digest (`@sha256:`): the
+bootstrap templates regenerate `teknoir.yaml` with the moving tag `docker.io/tekn0ir/toe:toe_v4` and
+`imagePullPolicy: Always`, which would undo a TOE rolled out with `playbooks/toe-image.yml`; after the script it puts
+the pinned image back the way `toe-image.yml` does (same shared tasks, `playbooks/tasks/toe-manifest-*.yml`: backup
+outside the manifests directory, image line replaced, `IfNotPresent`, wait for the rollout), prints one line
+(`TOE image: kept <image> ...` or `nothing to keep`) and leaves a TOE on a tag without a digest to the templates (test:
+`tests/toe-keep/run.sh`); copies the script root-only, runs it in the background
 (polled; a k3s restart may drop the connection for a while) with its output in `/var/log/teknoir-rebootstrap.log`,
 and removes it; removes duplicate members of the `users` and `sudo` groups that older scripts left; then checks
 that k3s is active, the TOE deployment is Ready, and that the platform user has passwordless sudo when the platform

@@ -68,24 +68,17 @@
     toe_allow_many: false
     toe_cr: toes.teknoir.org
     toe_cr_name: toe-config
-    toe_manifest: /var/lib/rancher/k3s/server/manifests/teknoir.yaml
-    toe_backup_dir: /var/lib/rancher/k3s/server/toe-image-backups
-    toe_namespace: kube-system
-    toe_deployment: toe
-    toe_kubectl_cmd: [k3s, kubectl]
     toe_crictl_cmd: [k3s, crictl]
     toe_use_become: true
-    # The toe container is the one that follows `command: - /manager`; groups: 1 prefix, 2 image, 3 middle, 4 policy.
-    toe_re: '([ ]+command:\n[ ]+- /manager\n[ ]+image: )(\S+)(\n[ ]+imagePullPolicy: )(\S+)'
     toe_image_re: '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?@sha256:[0-9a-f]{64}$'
-    toe_wait_argv: "{{ ['-n', toe_namespace, 'rollout', 'status', 'deploy/' ~ toe_deployment, '--timeout=' ~ toe_wait_timeout ~ 's'] }}"
-    toe_get_image_argv: "{{ ['-n', toe_namespace, 'get', 'deploy', toe_deployment, '-o', 'jsonpath=' ~ toe_jsonpath_image] }}"
     toe_jsonpath_pods: >-
       {range .items[*]}{.metadata.name} {.spec.containers[?(@.name=="toe")].image}
       {.status.containerStatuses[?(@.name=="toe")].imageID}
       restarts={.status.containerStatuses[?(@.name=="toe")].restartCount}{"\n"}{end}
-    toe_jsonpath_image: '{.spec.template.spec.containers[?(@.name=="toe")].image}'
   become: "{{ toe_use_become | bool }}"
+  # toe_manifest, toe_backup_dir, toe_namespace, toe_deployment, toe_kubectl_cmd, toe_re and the argv of the waits
+  vars_files:
+    - vars/toe-manifest.yml
 
   tasks:
     - name: Refuse to run without --limit
@@ -116,14 +109,8 @@
         quiet: true
       when: not (toe_rollback | bool)
 
-    - name: Read the TOE manifest
-      ansible.builtin.slurp:
-        src: "{{ toe_manifest }}"
-      register: toe_file
-
-    - name: Find the toe container in the manifest
-      ansible.builtin.set_fact:
-        toe_found: "{{ (toe_file.content | b64decode) | regex_findall(toe_re, multiline=True) }}"
+    - name: Read the TOE manifest and find the toe container (shared with rebootstrap-device.yml)
+      ansible.builtin.import_tasks: tasks/toe-manifest-read.yml
 
     - name: Refuse a manifest where the toe container is not found exactly once
       ansible.builtin.assert:
@@ -343,44 +330,8 @@
             toe_have: "{{ (toe_inspect.stdout | from_json).status.repoDigests | default([]) | map('regex_replace', '^.*@', '') | list }}"
           when: not ansible_check_mode or toe_inspect.rc == 0
 
-        - name: Make the backup directory (outside the manifests directory, so k3s does not apply backups)
-          ansible.builtin.file:
-            path: "{{ toe_backup_dir }}"
-            state: directory
-            mode: "0700"
-          when: toe_old_image != toe_image or toe_old_policy != 'IfNotPresent'
-
-        - name: Back up the manifest
-          ansible.builtin.copy:
-            src: "{{ toe_manifest }}"
-            dest: "{{ toe_backup_dir }}/teknoir.yaml.bak-{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
-            remote_src: true
-            mode: preserve
-          register: toe_bak
-          when: (toe_old_image != toe_image or toe_old_policy != 'IfNotPresent') and not ansible_check_mode
-
-        - name: Replace the image and imagePullPolicy of the toe container only
-          ansible.builtin.replace:
-            path: "{{ toe_manifest }}"
-            regexp: '{{ toe_re }}'
-            replace: '\g<1>{{ toe_image }}\g<3>IfNotPresent'
-          register: toe_edit
-
-        - name: Wait for the Deployment to carry the new image (k3s re-applies the file)
-          ansible.builtin.command:
-            argv: "{{ toe_kubectl_cmd + toe_get_image_argv }}"
-          register: toe_cur
-          until: toe_cur.stdout == toe_image
-          retries: "{{ (toe_wait_timeout | int / 5) | int }}"
-          delay: 5
-          changed_when: false
-          when: not ansible_check_mode
-
-        - name: Wait for the rollout
-          ansible.builtin.command:
-            argv: "{{ toe_kubectl_cmd + toe_wait_argv }}"
-          changed_when: false
-          when: not ansible_check_mode
+        - name: Back up the manifest, put the image on the toe container, wait for the rollout (shared with rebootstrap-device.yml)
+          ansible.builtin.import_tasks: tasks/toe-manifest-set-image.yml
 
       rescue:
         - name: Failed, restore the backup (if the manifest was changed)

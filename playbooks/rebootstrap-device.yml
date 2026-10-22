@@ -28,11 +28,21 @@
 #      three keys are read, never the rest of the k3s config (it holds the token). The run stops
 #      if the networks cannot be determined but the node's podCIDR is outside 10.42.0.0/16.
 #      Default networks: nothing is written.
-#   5. The script runs on the device as root (CREATE_USER=true, no prompts) and is removed. Its log
+#   5. Remembers a digest-pinned TOE image. The bootstrap templates regenerate
+#      /var/lib/rancher/k3s/server/manifests/teknoir.yaml with the moving tag docker.io/tekn0ir/toe:toe_v4
+#      and imagePullPolicy Always, which would undo a TOE rolled out with playbooks/toe-image.yml. The
+#      image line is read from the manifest the way toe-image.yml reads it (shared tasks in
+#      playbooks/tasks/toe-manifest-*.yml): the image after `command: - /manager`.
+#   6. The script runs on the device as root (CREATE_USER=true, no prompts) and is removed. Its log
 #      is kept in /var/log/teknoir-rebootstrap.log (root only; the script never prints a secret).
-#   6. Removes duplicate members of the users and sudo groups that older scripts left.
-#   7. Checks: k3s active, TOE Ready, and the platform user's sudo: passwordless when the platform
-#      holds no password for it (the run fails otherwise).
+#   7. Removes duplicate members of the users and sudo groups that older scripts left.
+#   8. Checks: k3s active; then, when the TOE image was pinned by digest (@sha256:) and the script
+#      changed it, puts it back as toe-image.yml does (backup outside the manifests directory, image
+#      line replaced, imagePullPolicy IfNotPresent) and waits for the rollout. A TOE on a tag without
+#      a digest is left to the templates. Prints one line: "TOE image: kept <image> ..." or "nothing
+#      to keep". If the script itself fails, nothing is put back; the failed run prints the image to
+#      restore with toe-image.yml. Then TOE Ready, and the platform user's sudo: passwordless when
+#      the platform holds no password for it (the run fails otherwise).
 #
 # Uses tnctl as the inventory (`tnctl ansible-playbook`), so the domain and teamspace come from
 # tnctl. The first run on a device whose platform user still needs a sudo password connects as
@@ -60,6 +70,11 @@
     rebootstrap_log: /var/log/teknoir-rebootstrap.log
     rebootstrap_script: /root/teknoir-rebootstrap.sh
     rebootstrap_allow_missing_cert: false
+    # The TOE image tasks (playbooks/tasks/toe-manifest-*.yml) wait this long for the rollout.
+    toe_wait_timeout: "{{ rebootstrap_ready_timeout }}"
+  # toe_manifest, toe_backup_dir, toe_re, toe_kubectl_cmd, ... (shared with toe-image.yml)
+  vars_files:
+    - vars/toe-manifest.yml
 
   tasks:
     - name: Refuse to run without --limit
@@ -187,6 +202,9 @@
             success_msg: "{{ tn_networks.stdout | trim }}"
             quiet: false
 
+        - name: Remember a digest-pinned TOE image (the templates write the moving tag toe_v4)
+          ansible.builtin.import_tasks: tasks/toe-keep-remember.yml
+
         - name: Run the bootstrap script
           block:
             - name: Copy the script to the device (root only)
@@ -233,6 +251,14 @@
                 msg: "{{ tn_warnings.stdout_lines }}"
               when: tn_warnings.stdout_lines | default([]) | length > 0
 
+            - name: Tell which TOE image to restore when the script failed
+              ansible.builtin.debug:
+                msg: >-
+                  The bootstrap script failed. {{ rebootstrap_device }} ran the digest-pinned TOE image
+                  {{ tn_toe_keep }} before; the manifest may now carry the template's toe_v4. Put it back with
+                  playbooks/toe-image.yml -e toe_image={{ tn_toe_keep }}
+              when: tn_toe_keep | default('') != '' and tn_run is defined and tn_run is failed
+
       always:
         - name: Remove the rendered scripts from the controller
           ansible.builtin.file:
@@ -261,6 +287,9 @@
     - name: K3s is active
       ansible.builtin.command: systemctl is-active k3s
       changed_when: false
+
+    - name: Put a digest-pinned TOE image back when the script replaced it
+      ansible.builtin.import_tasks: tasks/toe-keep-restore.yml
 
     - name: TOE is Ready
       ansible.builtin.command:
