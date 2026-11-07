@@ -7,7 +7,11 @@ them with **tnctl as the inventory**: `tnctl ansible` and `tnctl ansible-playboo
 > [Deprecated: the inventory plugin](#deprecated-the-inventory-plugin).
 
 ## Setup
-1. Install [tnctl](https://github.com/teknoir/cli) and Ansible (`ansible-core` is enough).
+1. Install [tnctl](https://github.com/teknoir/cli) and Ansible (`ansible-core` is enough). Devices on Ubuntu 20.04 (Jetsons on JetPack 5, L4T R35) have Python 3.8, and ansible-core 2.20 and newer stop at Gathering Facts there (`Ansible requires Python 3.9 or newer on the target`). tnctl sets `ansible_python_interpreter=/usr/bin/python3`, and the apt module needs that interpreter's `python3-apt`, so a newer Python on the device does not help. Run those devices with ansible-core 2.19:
+   ```bash
+   uv venv --python 3.12 ~/.venvs/ansible-2.19 && uv pip install --python ~/.venvs/ansible-2.19 'ansible-core<2.20'
+   PATH=~/.venvs/ansible-2.19/bin:$PATH tnctl ansible-playbook playbooks/desktop.yml --limit <orin>
+   ```
 2. Install the collections the playbooks use:
    ```bash
    ansible-galaxy collection install -r requirements.yml   # ansible.posix, community.general
@@ -330,6 +334,121 @@ changed), the proof image (removed again, kept when it was there before, a faile
 failures after the write (probe pull, restart, `hosts.toml`, node not Ready: restored), the node name, an
 agent, and that the password, the token and the robot secret appear in no output, also with `-vvv`.
 
+## Remote desktop (host mode)
+`playbooks/desktop.yml` turns on the browser remote desktop of a device in **host mode**: the device's own desktop
+environment runs in a TigerVNC X server (Xvnc) whose VNC listener is the unix socket
+`/run/teknoir-desktop/vnc.sock`. The platform's `teknoir-desktop` pod (injected by the platform, not by this
+playbook) mounts `/run/teknoir-desktop` as a hostPath and bridges the socket to the browser; the browser reaches that
+pod only through Tunneling, and only a user who may `create pods/exec` in the device's teamspace gets to it (the hub
+checks this). This playbook installs the **host side** only.
+
+```bash
+# Install, start and check (one device at a time: serial 1)
+tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se
+tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se -e desktop_geometry=1920x1080
+
+# A device that must not get XFCE (the run fails when it has no session of its own)
+tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se -e desktop_install_xfce=false
+
+# Remove the host side again
+tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se -e desktop_state=absent
+```
+`--limit` is required: the playbook refuses to run against every device.
+A Jetson on JetPack 5 (Ubuntu 20.04, Python 3.8) needs ansible-core 2.19 or older on your side, see [Setup](#setup).
+
+| Variable | Default | |
+| --- | --- | --- |
+| `desktop_state` | `present` | `present` installs and starts; `absent` stops, disables and removes the unit, the drop-in, the script, the runtime directory and the X auth cookie |
+| `desktop_user` | `teknoir` | the user whose desktop runs; it must exist (the run fails with `user <u> does not exist on <host>`), and it must not be root (uid 0): the desktop has no password. A plain user name (`^[a-z_][a-z0-9_-]{0,31}$`), because it goes into the unit's drop-in |
+| `desktop_group` | `teknoir-desktop` | the socket group; a plain group name (`^[a-z_][a-z0-9_-]{0,31}$`), for the same reason |
+| `desktop_gid` | `64080` | its gid, the same on every device (the platform's pod runs with `supplementalGroups: [64080]`); an integer 1000..65535 |
+| `desktop_geometry` | `1600x900` | the screen size (`^[0-9]{3,4}x[0-9]{3,4}$`) |
+| `desktop_install_xfce` | `auto` | `auto`: install XFCE (`xfce4`, `xfce4-terminal`) only when none of `startxfce4`, `startlxqt`, `mate-session` is on the PATH (GNOME never counts, not even with `gnome-flashback`: plain GNOME needs a full graphics stack, and the playbook does not look for the flashback session); `true`: always; `false`: never (the run fails when no session is found) |
+
+Per device (`serial: 1`):
+1. validates the variables, then refuses a device that is not Debian or Ubuntu, a `desktop_user` that does not exist
+   or is root (uid 0), and a socket group or gid that belongs to something else (the name with another gid, or the gid
+   with another name) or that has members other than the desktop user and root (in the group, or with gid 64080 as
+   their primary group), and a device with no session (`startxfce4`, `startlxqt`, `mate-session`) when
+   `desktop_install_xfce` is `false`. Nothing is changed before those checks pass;
+2. creates the group `teknoir-desktop` with gid 64080 when it does not exist;
+3. installs `tigervnc-standalone-server`, `dbus-x11` and `xauth` (the session script needs `xauth` for the X auth
+   cookie), and XFCE per `desktop_install_xfce` (without its recommendations);
+4. installs the session script `/usr/local/libexec/teknoir-desktop-session` (root, 0755) and the unit
+   `/etc/systemd/system/teknoir-desktop.service` (root, 0644) from `playbooks/files/teknoir-desktop/`, and the
+   drop-in `10-teknoir.conf` (`User`, `Group`, `TEKNOIR_DESKTOP_GROUP`, `TEKNOIR_DESKTOP_GEOMETRY`);
+5. refuses another drop-in of the unit that sets a different `User=` or `Group=` (an `override.conf` from
+   `systemctl edit` sorts after `10-teknoir.conf` and wins; checked with `systemctl show` after the files are written,
+   before the unit is started or restarted), then enables and starts the unit, and restarts it only when one of those
+   files changed or XFCE was just installed (the session script then switches to XFCE), or when the running unit is
+   older than the installed session script, unit or drop-in (a run that stopped before its restart);
+6. checks that the desktop really runs: the socket appears within 30 s, it is a **socket** of mode `0660` owned by
+   `desktop_user` in group `teknoir-desktop`, `/run/teknoir-desktop` belongs to that group with group search
+   permission, the server answers the VNC banner (`RFB `) on the socket (a `python3` probe as root, 12 bytes, 3 s) and
+   Xvnc listens on no TCP port (only the unit's own `Xvnc` counts: another VNC server on the device, a
+   `tigervncserver :1` on `127.0.0.1:5901` or a RealVNC one, is not this playbook's), and 8 s after the probe the unit
+   is still the same process (a session that exits restarts it) and runs a session process (`xfce4-session`,
+   `lxqt-session`, `mate-session` or `gnome-session`). When the socket's owner, group or mode is wrong, or the server
+   listens on TCP, the unit is first stopped and disabled. A failed check prints the last 30 lines of
+   `journalctl -u teknoir-desktop` and fails the run;
+7. prints one line: the user, the group and gid, the session, the Xvnc version, and the next step.
+
+The two host files are vendored from `teknoir/teknoir-desktop` (`host/`); do not edit them here, they are refreshed
+from that repo. Everything else is set through the drop-in. Change the user with `-e desktop_user=<user>`, not with an
+`override.conf` as in the unit's comment: the playbook refuses a drop-in that sets another `User=` or `Group=`.
+
+**What the unit does.** The session runs as `desktop_user` with primary group `teknoir-desktop`; it is enabled for
+`multi-user.target`, so it starts at every boot. `Restart=always`: when the session exits — a logout, or a crash — the
+unit starts it again after 5 s, so a logout gives a fresh desktop. It gives up instead of restarting when a package is
+missing (no desktop session, no TigerVNC that knows `-rfbunixpath`, no `xauth`, no `dbus-x11`): the session script
+then exits with status 78 (EX_CONFIG), and `RestartPreventExitStatus=78` leaves the unit failed. Install the package
+and run `systemctl restart teknoir-desktop`.
+`RuntimeDirectoryPreserve=yes` keeps `/run/teknoir-desktop` (same inode, so the pod's hostPath keeps working) across a
+stop and restart, and `PrivateTmp=yes` gives the unit its own `/tmp` for the X socket and lock. The X display has its
+own MIT-MAGIC-COOKIE in `~/.teknoir-desktop.Xauthority` of `desktop_user` (mode 0600, a new one at every start), so
+reaching the X socket is not enough to read the screen; it is outside `/run/teknoir-desktop` on purpose, because the
+pod can read that directory.
+
+`desktop_state=absent` stops and disables the unit and removes the drop-in, the unit, the session script and
+`/run/teknoir-desktop` (which `RuntimeDirectoryPreserve` would otherwise leave behind), and the X auth cookie
+`~/.teknoir-desktop.Xauthority` of the user the unit ran as (read from the unit, so `-e desktop_user` is not needed). It leaves the
+packages, the user and the group behind (the group's gid is shared with the platform, and another workload may use the
+packages). A second run reports no changes, and it fails rather than report success when the unit still runs after the
+removal.
+**Turn the desktop off on the Device before you remove the host side**:
+`kubectl --context <ctx> -n <teamspace> patch device <name> --type merge -p '{"spec":{"desktop":null}}'`. Otherwise the
+platform's pod loses `/run/teknoir-desktop`: it fails its health check and, after a reboot, waits in ContainerCreating
+for the hostPath, while the Device still shows the desktop as `Published`.
+
+**Security model.** There is no VNC password, and host mode hands over the device's own session. Whoever reaches the
+VNC server has a shell as `desktop_user`: XFCE has a terminal, so treat the desktop like SSH. When the platform user
+logs in by key only, it has passwordless sudo (`/etc/sudoers.d/90-teknoir-platform-user`), and the desktop is then
+root on the device. A user with a password can still `sudo` with it. Xvnc listens on no TCP port (`-rfbport -1`,
+`-nolisten tcp`). Its VNC listener is `/run/teknoir-desktop/vnc.sock`: mode `0660`, owner `desktop_user`, group
+`teknoir-desktop` (gid 64080), in a `0750` directory with the same owner and group. The X display `:7` itself also has
+local sockets, and only its X auth cookie guards them. On the device, the VNC socket can be opened by root, by
+`desktop_user`, by members of group `teknoir-desktop`, and by any pod that mounts `/run/teknoir-desktop` from the host
+and runs as root, as the user's uid, or with `supplementalGroups: [64080]` (the platform's pod). While the Device has
+`spec.desktop.mode: host`, that pod serves the session on TCP 6080 with no password (Service
+`desktop.teknoir-desktop:6080`). Its NetworkPolicy refuses other pods but admits the node the pod runs on. So every
+process on that node's host network reaches the desktop as well, including any local user and any `hostNetwork` pod.
+From outside the device, the browser gets there only through Tunneling, after the platform login and the hub's check
+that the user may `create pods/exec` in the teamspace. Turn host mode on only on devices that have no untrusted local
+users and no untrusted host-network workloads.
+
+**Next step: turn the desktop on for the Device in the platform.** The Device object says whether the platform
+injects the pod. Without it nothing outside the device reaches the session, but the unit still starts at every boot
+and runs the desktop session (Xvnc and the session found or installed above) as `desktop_user`. The desktop needs
+Tunneling on the Device (annotation `ztna.teknoir.org/wireguard: enabled`; without it `status.desktop.state` is
+`NeedsTunneling`):
+```bash
+kubectl --context <ctx> -n <teamspace> patch device <name> --type merge -p '{"spec":{"desktop":{"mode":"host"}}}'
+```
+(or later in the UI). Check it with
+`kubectl --context <ctx> -n <teamspace> get device <name> -o jsonpath='{.subresources.status.desktop}'`: `state` is
+`Published`, and `url` is set once the Tunneling web gateway serves it. `Published` says the pod was injected, not
+that the host unit works; that is what this playbook's check is for.
+
 ## Node roles
 A node role is a set of k3s node labels (and optional taints), so workloads can be assigned to the nodes that fill
 the role with a plain `nodeSelector`:
@@ -456,6 +575,14 @@ teamspace as every other tnctl command, WireGuard where it is active, passwordle
   image until that image ships tnctl.
 
 # CHANGELOG
+## 2026-11-07
+* Added `playbooks/desktop.yml`: install, check and remove the host side of the platform's browser remote desktop
+  (host mode) on a device — TigerVNC Xvnc on the unix socket `/run/teknoir-desktop/vnc.sock` in group
+  `teknoir-desktop` (gid 64080), Xvnc on no TCP port, `xauth` for the display's cookie. It refuses to run without
+  `--limit`, refuses a root desktop user and a socket group with other members, and checks that the session stays up
+  and runs a desktop session. The host files are vendored from `teknoir/teknoir-desktop` (`host/`) and configured
+  through a systemd drop-in.
+
 ## 2026-10-16 (2)
 * tnctl is the inventory: README rewritten for `tnctl ansible` / `tnctl ansible-playbook`; the inventory plugin
   (`inventory.py`, `install.sh`) is deprecated.
