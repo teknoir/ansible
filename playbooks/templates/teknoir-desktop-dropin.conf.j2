@@ -1,0 +1,6 @@
+# Managed by teknoir/ansible playbooks/desktop.yml
+[Service]
+User={{ desktop_user }}
+Group={{ desktop_group }}
+Environment=TEKNOIR_DESKTOP_GROUP={{ desktop_group }}
+Environment=TEKNOIR_DESKTOP_GEOMETRY={{ desktop_geometry }}

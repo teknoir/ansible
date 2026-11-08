@@ -1,0 +1,758 @@
+---
+# Remote desktop (host mode) for a Teknoir device: the device's own desktop environment in a TigerVNC X server (Xvnc)
+# whose VNC listener is the unix socket /run/teknoir-desktop/vnc.sock. The platform's teknoir-desktop pod (installed by
+# the platform, not by this playbook) mounts /run/teknoir-desktop and bridges the socket to the browser through
+# Tunneling. Xvnc listens on no TCP port (the platform's pod serves the session on TCP 6080; README "Security model").
+# The host files are vendored from teknoir/teknoir-desktop (host/) in files/teknoir-desktop/ and must not be edited
+# here; the settings go into a systemd drop-in. README: "Remote desktop (host mode)".
+#
+# What it does, per device (serial 1, one device at a time):
+#   1. refuses anything that is not Debian or Ubuntu, a desktop user that does not exist or has uid 0 (root), a socket
+#      group that is taken (the name with another gid, or the gid with another name) or that has members other than
+#      the desktop user and root (in the group, or with gid 64080 as their primary group), and a device without a
+#      session when desktop_install_xfce=false; nothing is changed before those checks pass,
+#   2. creates the socket group desktop_group with gid desktop_gid (64080 on every Teknoir device; the platform's pod
+#      runs with supplementalGroups [64080]),
+#   3. installs tigervnc-standalone-server, dbus-x11 and xauth, and XFCE (xfce4, xfce4-terminal) unless a session
+#      (startxfce4, startlxqt, mate-session) is already on the PATH; desktop_install_xfce: auto (default), true, false,
+#   4. installs the session script (/usr/local/libexec/teknoir-desktop-session, 0755) and the unit
+#      (/etc/systemd/system/teknoir-desktop.service, 0644) from files/teknoir-desktop/, and the drop-in
+#      10-teknoir.conf with the user, the group and the geometry,
+#   5. refuses another drop-in of the unit that sets a different User= or Group= (an override.conf from systemctl edit
+#      sorts after 10-teknoir.conf and wins; checked with systemctl show after the files are written, before the unit
+#      is started or restarted), then enables and starts the unit, and restarts it when one of the files or the
+#      drop-in changed or XFCE was just installed (the session script prefers startxfce4), or when the running unit is
+#      older than the installed session script, unit or drop-in (a run that stopped before its restart),
+#   6. checks that the desktop really runs: the socket appears within 30 s, it is a socket of mode 0660 owned by
+#      desktop_user in group desktop_group, the runtime directory belongs to that group with group search permission,
+#      the VNC server answers the RFB banner on the socket and has no TCP listener, the unit is still the same process
+#      8 s after the probe (a session that exits restarts it) and it runs a session process (xfce4-session,
+#      lxqt-session, mate-session or gnome-session). When the socket's owner, group or mode is wrong, or the server
+#      listens on TCP, the unit is stopped and disabled first. A failed check shows the last 30 lines of the journal,
+#   7. prints the user, the group and gid, the session, the Xvnc version, and the next step (turn the desktop on for
+#      the Device in the platform).
+#
+# desktop_state=absent stops and disables the unit, removes the drop-in, the unit, the session script, the runtime
+# directory and the X auth cookie (~/.teknoir-desktop.Xauthority of the user the unit runs as, read from the unit, so
+# -e desktop_user is not needed), and leaves the packages, the user and the group behind. A second run reports no
+# changes; it fails, instead of reporting success, when the unit still runs after the removal.
+#
+# --limit is required: the playbook refuses to run without it.
+#
+#   # Install and check (one device at a time)
+#   tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se
+#   tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se -e desktop_geometry=1920x1080
+#   tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se -e desktop_install_xfce=false
+#   # Only look: --check installs and removes nothing, does not touch the unit and skips the checks
+#   tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se --check
+#   # Remove the host side again
+#   tnctl ansible-playbook playbooks/desktop.yml --limit rpi4-white-se -e desktop_state=absent
+#
+# Needs: sudo on the device (become), Debian or Ubuntu with apt, and an apt source that has the packages (internet, or
+# the device's own mirror on an airgapped install). Ubuntu 20.04 (Python 3.8, JetPack 5) needs ansible-core 2.19 or
+# older on the controller (README, Setup). Test on a VM or a virtual device first.
+
+- name: Remote desktop (host mode) on a device
+  hosts: all
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: false
+  become: true
+  vars:
+    # present installs and starts; absent stops, disables and removes the unit, the drop-in, the script, the runtime
+    # directory and the X auth cookie.
+    desktop_state: present
+    # The user whose desktop runs (the device's login user from tnctl's ansible_teknoir_login_user, else teknoir),
+    # the socket group (gid 64080 on every device) and the screen size.
+    desktop_user: "{{ ansible_teknoir_login_user | default('teknoir') }}"
+    desktop_group: teknoir-desktop
+    desktop_gid: 64080
+    desktop_geometry: 1600x900
+    # auto: install XFCE only when no session (startxfce4, startlxqt, mate-session) is on the PATH; true: always;
+    # false: never (the run fails when the device has no session).
+    desktop_install_xfce: auto
+    # Where things are.
+    desktop_unit: teknoir-desktop
+    desktop_unit_path: /etc/systemd/system/{{ desktop_unit }}.service
+    desktop_dropin_dir: /etc/systemd/system/{{ desktop_unit }}.service.d
+    desktop_dropin_file: "{{ desktop_dropin_dir }}/10-teknoir.conf"
+    desktop_session_script: /usr/local/libexec/teknoir-desktop-session
+    desktop_session_dir: /usr/local/libexec
+    desktop_runtime_dir: /run/teknoir-desktop
+    desktop_socket: "{{ desktop_runtime_dir }}/vnc.sock"
+    # Seconds to wait for the socket after the unit was (re)started, and the patterns of the geometry and of a name
+    # that goes into the drop-in (a newline or "=" in it would inject unit directives).
+    desktop_socket_timeout: 30
+    desktop_geometry_re: '^[0-9]{3,4}x[0-9]{3,4}$'
+    desktop_name_re: '^[a-z_][a-z0-9_-]{0,31}$'
+    # Seconds the unit must stay the same process after the probe (a session that exits restarts the unit), and what a
+    # session process looks like in systemd-cgls.
+    desktop_settle_seconds: 8
+    desktop_session_proc_re: '^\W*[0-9]+ (\S*/)?(xfce4-session|lxqt-session|mate-session|gnome-session(-binary)?)( |$)'
+    desktop_base_packages: [tigervnc-standalone-server, dbus-x11, xauth]
+    desktop_xfce_packages: [xfce4, xfce4-terminal]
+
+  tasks:
+    - name: Refuse to run without --limit
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Pass --limit <device|group>. This playbook never runs against every device."
+        quiet: true
+
+    # ------------------------------------------------------------------ validation
+    - name: Normalise desktop_install_xfce (true/false booleans are accepted)
+      ansible.builtin.set_fact:
+        desktop_install_xfce_norm: "{{ desktop_install_xfce | string | lower }}"
+
+    - name: Validate the variables
+      ansible.builtin.assert:
+        that:
+          - desktop_state in ['present', 'absent']
+          - desktop_install_xfce_norm in ['auto', 'true', 'false']
+          - desktop_user is string
+          - desktop_user is match(desktop_name_re)
+          - desktop_group is string
+          - desktop_group is match(desktop_name_re)
+          - desktop_geometry is string
+          - desktop_geometry is match(desktop_geometry_re)
+          - desktop_gid | string is match('^[0-9]{1,5}$')
+          - desktop_gid | int >= 1000
+          - desktop_gid | int <= 65535
+        fail_msg: >-
+          {{ inventory_hostname }}: desktop_state must be present or absent (is {{ desktop_state }}), desktop_install_xfce
+          auto, true or false (is {{ desktop_install_xfce }}), desktop_user a user name (is {{ desktop_user }}),
+          desktop_group a group name (is {{ desktop_group }}), desktop_geometry <width>x<height> with 3 or 4 digits each
+          (is {{ desktop_geometry }}), desktop_gid a number 1000..65535 (is {{ desktop_gid }}). Nothing was changed.
+        quiet: true
+
+    # ------------------------------------------------------------------ present
+    - name: Install and check the desktop
+      when: desktop_state == 'present'
+      block:
+        # The refusals that read the device come before the first task that changes anything, so their "Nothing was
+        # changed" is true. The one refusal that needs the written files (another drop-in of the unit) runs after them.
+        - name: Refuse a device that is not Debian or Ubuntu
+          ansible.builtin.assert:
+            that: ansible_facts.os_family == 'Debian'
+            fail_msg: >-
+              {{ inventory_hostname }}: this playbook installs Debian packages ({{ desktop_base_packages | join(', ') }});
+              the device runs {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}
+              ({{ ansible_facts.os_family }}). Nothing was changed.
+            quiet: true
+
+        - name: The desktop user
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ desktop_user }}"
+            fail_key: false
+          register: desktop_passwd
+
+        - name: Refuse a desktop user that does not exist
+          ansible.builtin.assert:
+            that: (desktop_passwd.ansible_facts.getent_passwd | default({})).get(desktop_user) is not none
+            fail_msg: >-
+              user {{ desktop_user }} does not exist on {{ inventory_hostname }}
+              (pass -e desktop_user=<user>). Nothing was changed.
+            quiet: true
+
+        - name: Refuse root as the desktop user
+          ansible.builtin.assert:
+            that: desktop_passwd.ansible_facts.getent_passwd[desktop_user][1] | int != 0
+            fail_msg: >-
+              {{ inventory_hostname }}: desktop_user {{ desktop_user }} has uid 0; the desktop has no VNC password and
+              must not run as root (pass -e desktop_user=<user>). Nothing was changed.
+            quiet: true
+
+        # The socket group, by name and by gid: both must agree with desktop_group/desktop_gid before anything runs.
+        # getent keys its result by the entry it found, so the by-gid lookup is read from the entries themselves. The
+        # by-name value is a list (empty when the group is missing), which older templating keeps as a list as well.
+        - name: The group database, by name
+          ansible.builtin.getent:
+            database: group
+            key: "{{ desktop_group }}"
+            fail_key: false
+          register: desktop_group_name
+
+        - name: The group database, by gid
+          ansible.builtin.getent:
+            database: group
+            key: "{{ desktop_gid }}"
+            fail_key: false
+          register: desktop_group_gid
+
+        # getent by gid shows only the first group with that gid (and by name only the first line of that name), but
+        # initgroups hands gid 64080 to the members of every line that has it: a group made with groupadd -o -g 64080,
+        # or a second line of the same name. So every line of the group database is read as well.
+        - name: Every line of the group database
+          ansible.builtin.command:
+            argv: [getent, group]
+          register: desktop_group_all
+          changed_when: false
+          check_mode: false
+
+        - name: What the group database says
+          ansible.builtin.set_fact:
+            desktop_group_by_name: "{{ (desktop_group_name.ansible_facts.getent_group | default({})).get(desktop_group) or [] }}"
+            desktop_group_by_gid: >-
+              {{ ((desktop_group_gid.ansible_facts.getent_group | default({}) | dict2items
+              | selectattr('value') | map(attribute='key') | list)
+              + (desktop_group_all.stdout_lines | map('split', ':')
+              | selectattr('2', 'equalto', desktop_gid | string) | map('first') | list)) | unique | list }}
+            desktop_group_gid_members: >-
+              {{ desktop_group_all.stdout_lines | map('split', ':')
+              | selectattr('2', 'equalto', desktop_gid | string) | map(attribute='3', default='') | join(',') }}
+
+        - name: Refuse a socket group or gid that belongs to something else
+          ansible.builtin.assert:
+            that:
+              - desktop_group_by_name | length == 0 or desktop_group_by_name[1] | string == desktop_gid | string
+              - desktop_group_by_gid | reject('equalto', desktop_group) | list | length == 0
+            fail_msg: >-
+              {{ inventory_hostname }}: {{
+              ('group ' ~ desktop_group ~ ' exists with gid ' ~ desktop_group_by_name[1] ~ ', not ' ~ desktop_gid)
+              if (desktop_group_by_name | length > 0 and desktop_group_by_name[1] | string != desktop_gid | string)
+              else ('gid ' ~ desktop_gid ~ ' is taken by group '
+              ~ (desktop_group_by_gid | reject('equalto', desktop_group) | join(', ')))
+              }}. The platform's desktop pod runs with supplementalGroups [{{ desktop_gid }}]. Nothing was changed.
+            quiet: true
+
+        # A member of the socket group (or a user whose primary group it is) gets gid 64080 at login and can open the
+        # socket without a password; the playbook never adds one, so anyone but the desktop user and root is refused
+        # (root can open the socket anyway).
+        - name: The users whose primary group is the socket gid
+          ansible.builtin.getent:
+            database: passwd
+          register: desktop_passwd_all
+
+        - name: Refuse a socket group with members other than the desktop user
+          ansible.builtin.assert:
+            that: desktop_group_others | length == 0
+            fail_msg: >-
+              {{ inventory_hostname }}: {{ desktop_group_others | join(', ') }} can open the desktop without a password
+              (members of group {{ desktop_group }}, or their primary group is gid {{ desktop_gid }}). Remove them
+              (gpasswd -d <user> {{ desktop_group }}, or usermod -g <group> <user>) and run again. Nothing was changed.
+            quiet: true
+          vars:
+            desktop_group_others: >-
+              {{ ((((desktop_group_by_name[2] if desktop_group_by_name | length > 2 else '') ~ ',' ~ desktop_group_gid_members).split(','))
+              + (desktop_passwd_all.ansible_facts.getent_passwd | default({}) | dict2items
+                 | selectattr('value.2', 'equalto', desktop_gid | string) | map(attribute='key') | list))
+              | map('trim') | select | reject('in', [desktop_user, 'root']) | unique | list }}
+
+        # Which session the device already has, before XFCE is installed: the session script needs one of these (GNOME
+        # never counts, not even with gnome-flashback: the playbook does not look for the flashback session).
+        - name: Look for a desktop session on the device
+          ansible.builtin.shell: command -v startxfce4 || command -v startlxqt || command -v mate-session
+          register: desktop_session_found
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Decide whether XFCE is installed
+          ansible.builtin.set_fact:
+            desktop_need_xfce: >-
+              {{ desktop_install_xfce_norm == 'true' or
+              (desktop_install_xfce_norm == 'auto' and desktop_session_found.rc != 0) }}
+
+        - name: Refuse when there is no session and XFCE may not be installed
+          ansible.builtin.assert:
+            that: not (desktop_install_xfce_norm == 'false' and desktop_session_found.rc != 0)
+            fail_msg: >-
+              {{ inventory_hostname }}: no desktop session found (startxfce4, startlxqt, mate-session) and
+              desktop_install_xfce=false, so the session script would exit at once. Nothing was changed; drop the
+              variable or pass desktop_state=absent.
+            quiet: true
+
+        # -------------------------------------------------------------- changes
+        - name: Create the socket group
+          ansible.builtin.group:
+            name: "{{ desktop_group }}"
+            gid: "{{ desktop_gid }}"
+            system: true
+          when: desktop_group_by_name | length == 0
+
+        - name: Install TigerVNC, dbus-x11 and xauth
+          ansible.builtin.apt:
+            name: "{{ desktop_base_packages }}"
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Install XFCE (without its recommendations)
+          ansible.builtin.apt:
+            name: "{{ desktop_xfce_packages }}"
+            state: present
+            install_recommends: false
+            update_cache: true
+            cache_valid_time: 3600
+          when: desktop_need_xfce | bool
+          notify: Restart the desktop unit
+
+        - name: Create the directory of the session script
+          ansible.builtin.file:
+            path: "{{ desktop_session_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Install the session script
+          ansible.builtin.copy:
+            src: files/teknoir-desktop/teknoir-desktop-session
+            dest: "{{ desktop_session_script }}"
+            owner: root
+            group: root
+            mode: "0755"
+          notify: Restart the desktop unit
+
+        - name: Install the unit
+          ansible.builtin.copy:
+            src: files/teknoir-desktop/teknoir-desktop.service
+            dest: "{{ desktop_unit_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Restart the desktop unit
+
+        - name: Create the drop-in directory
+          ansible.builtin.file:
+            path: "{{ desktop_dropin_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Install the drop-in (user, group and geometry)
+          ansible.builtin.template:
+            src: teknoir-desktop-dropin.conf.j2
+            dest: "{{ desktop_dropin_file }}"
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Restart the desktop unit
+
+        # Another drop-in (override.conf from systemctl edit) sorts after 10-teknoir.conf and wins. Refuse it before the
+        # unit starts, so the playbook never starts the desktop as root or as another user.
+        - name: Read the unit and its drop-ins
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+          when: not ansible_check_mode
+
+        - name: The user and group the unit runs as, with every drop-in applied
+          ansible.builtin.command:
+            argv: [systemctl, show, "{{ desktop_unit }}", --property=User, --property=Group, --property=DropInPaths]
+          register: desktop_effective
+          changed_when: false
+          check_mode: false
+          when: not ansible_check_mode
+
+        - name: Refuse another drop-in that changes the user or the group
+          ansible.builtin.assert:
+            that:
+              - ('User=' ~ desktop_user) in desktop_effective.stdout_lines
+              - ('Group=' ~ desktop_group) in desktop_effective.stdout_lines
+            fail_msg: >-
+              {{ inventory_hostname }}: another drop-in of {{ desktop_unit }} overrides {{ desktop_dropin_file }}
+              ({{ desktop_effective.stdout_lines | join(', ') }}); remove it and run again. The unit was not (re)started.
+            quiet: true
+          when: not ansible_check_mode
+
+        # Check mode writes no unit file, and systemd_service fails for a unit it cannot find even in check mode (the
+        # old graceful exit is gone since ansible-core 2.19), so check mode does not touch systemd at all.
+        - name: Enable and start the unit
+          ansible.builtin.systemd_service:
+            name: "{{ desktop_unit }}"
+            daemon_reload: true
+            enabled: true
+            state: started
+          when: not ansible_check_mode
+
+        # A run that stopped after a copy but before the flush (a dropped tunnel, a failed task) loses its restart; the
+        # next run then finds nothing changed. Restart when an installed file is newer than the running unit.
+        - name: A running unit that is older than its files
+          ansible.builtin.shell: |
+            set -o pipefail
+            pid=$(systemctl show {{ desktop_unit }} --property=MainPID --value)
+            [ "${pid:-0}" -gt 0 ] || exit 0
+            elapsed=$(ps -o etimes= -p "$pid") || exit 0
+            started=$(( $(date +%s) - elapsed ))
+            for f in {{ desktop_session_script }} {{ desktop_unit_path }} {{ desktop_dropin_file }}; do
+              [ "$(stat -c %Y "$f")" -le "$started" ] || { echo stale; exit 0; }
+            done
+          args:
+            executable: /bin/bash
+          register: desktop_stale
+          changed_when: desktop_stale.stdout == 'stale'
+          notify: Restart the desktop unit
+          when: not ansible_check_mode
+
+        - name: Restart the unit when a file changed, before the checks
+          ansible.builtin.meta: flush_handlers
+
+        # -------------------------------------------------------------- checks (change nothing; a failure shows the journal)
+        - name: The desktop came up
+          when: not ansible_check_mode
+          block:
+            - name: Wait for the VNC socket
+              ansible.builtin.wait_for:
+                path: "{{ desktop_socket }}"
+                timeout: "{{ desktop_socket_timeout }}"
+
+            - name: The VNC socket and the runtime directory
+              ansible.builtin.stat:
+                path: "{{ item }}"
+              loop:
+                - "{{ desktop_socket }}"
+                - "{{ desktop_runtime_dir }}"
+              register: desktop_checks
+
+            - name: A socket of mode 0660 in the socket group
+              ansible.builtin.assert:
+                that:
+                  - desktop_sock.stat.exists | default(false)
+                  - desktop_sock.stat.issock | default(false)
+                  - desktop_sock.stat.mode | default('') == '0660'
+                  - desktop_sock.stat.gr_name | default('') == desktop_group
+                  - desktop_sock.stat.pw_name | default('') == desktop_user
+                fail_msg: >-
+                  {{ inventory_hostname }}: {{ desktop_socket }} must be a socket of mode 0660 owned by {{ desktop_user }}
+                  in group {{ desktop_group }}; it is {{ 'missing' if not desktop_sock.stat.exists else
+                  ('not a socket, ' if not desktop_sock.stat.issock else '') ~ 'mode ' ~ desktop_sock.stat.mode ~
+                  ', group ' ~ (desktop_sock.stat.gr_name | default(desktop_sock.stat.gid)) ~
+                  ', owner ' ~ (desktop_sock.stat.pw_name | default(desktop_sock.stat.uid)) }}.
+                quiet: true
+              vars:
+                desktop_sock: "{{ desktop_checks.results[0] }}"
+
+            - name: The runtime directory belongs to the socket group
+              ansible.builtin.assert:
+                that:
+                  - desktop_rundir.stat.exists | default(false)
+                  - desktop_rundir.stat.isdir | default(false)
+                  - desktop_rundir.stat.gr_name | default('') == desktop_group
+                  - desktop_rundir.stat.xgrp | default(false)
+                fail_msg: >-
+                  {{ inventory_hostname }}: {{ desktop_runtime_dir }} must be a directory in group {{ desktop_group }}
+                  with group search permission; it is {{ 'missing' if not desktop_rundir.stat.exists else
+                  'group ' ~ (desktop_rundir.stat.gr_name | default(desktop_rundir.stat.gid)) ~
+                  ', mode ' ~ desktop_rundir.stat.mode }}.
+                quiet: true
+              vars:
+                desktop_rundir: "{{ desktop_checks.results[1] }}"
+
+            # The server has to speak RFB over the socket (the pod's websockify bridges exactly this): read the 12 byte
+            # banner within 3 s. -I keeps the device's environment and working directory out of it.
+            - name: Read the RFB banner from the socket (as root)
+              ansible.builtin.command:
+                argv:
+                  - python3
+                  - -I
+                  - -c
+                  - |-
+                    import socket, sys
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(3)
+                    s.connect(sys.argv[1])
+                    data = b""
+                    while len(data) < 12:
+                        chunk = s.recv(12 - len(data))
+                        if not chunk:
+                            break
+                        data += chunk
+                    sys.stdout.write(data.decode("latin-1"))
+                  - "{{ desktop_socket }}"
+              register: desktop_probe
+              changed_when: false
+              failed_when: false
+              check_mode: false
+
+            - name: The VNC server answers RFB on the socket
+              ansible.builtin.assert:
+                that:
+                  - desktop_probe.rc == 0
+                  - desktop_probe.stdout is match('RFB ')
+                fail_msg: >-
+                  {{ inventory_hostname }}: no RFB banner from {{ desktop_socket }} (python exit code
+                  {{ desktop_probe.rc }}, read '{{ desktop_probe.stdout | default('') }}',
+                  {{ desktop_probe.stderr | default('') | trim }}).
+                quiet: true
+
+            # Only the unit's own Xvnc counts: another VNC server on the device (a tigervncserver@:1 listening on
+            # 127.0.0.1:5901, RealVNC) is not ours.
+            - name: The TCP listeners of the VNC server
+              ansible.builtin.shell: |
+                set -o pipefail
+                main=$(systemctl show {{ desktop_unit }} --property=MainPID --value)
+                pids=$(pgrep -d '|' -P "${main:-0}" -x 'Xtigervnc|Xvnc' || true)
+                [ -n "$pids" ] || exit 0
+                ss -Hltnp | { grep -E "\"(Xtigervnc|Xvnc)\",pid=(${pids})," || true; }
+              args:
+                executable: /bin/bash
+              register: desktop_tcp
+              changed_when: false
+              check_mode: false
+
+            - name: The VNC server has no TCP listener
+              ansible.builtin.assert:
+                that: desktop_tcp.stdout | trim | length == 0
+                fail_msg: "{{ inventory_hostname }}: the VNC server listens on TCP: {{ desktop_tcp.stdout | trim }}"
+                quiet: true
+
+            # Xvnc answering proves only the X server. The session starts after the socket appears and the unit restarts
+            # when it exits, so check that the unit is still the same process a while later and runs a session.
+            - name: The unit's main PID after the probe
+              ansible.builtin.command:
+                argv: [systemctl, show, "{{ desktop_unit }}", --property=MainPID, --value]
+              register: desktop_pid_before
+              changed_when: false
+              check_mode: false
+
+            - name: Wait so that a session that exits shows up as a restart
+              ansible.builtin.wait_for:
+                timeout: "{{ desktop_settle_seconds }}"
+
+            - name: The unit after the wait
+              ansible.builtin.command:
+                argv: [systemctl, show, "{{ desktop_unit }}", --property=ActiveState, --property=SubState, --property=MainPID]
+              register: desktop_show_after
+              changed_when: false
+              check_mode: false
+
+            - name: The processes of the unit
+              ansible.builtin.command:
+                argv: [systemd-cgls, --no-pager, --full, --unit, "{{ desktop_unit }}.service"]
+              register: desktop_cgls
+              changed_when: false
+              failed_when: false
+              check_mode: false
+
+            - name: The unit stayed up and runs a desktop session
+              ansible.builtin.assert:
+                that:
+                  - "'ActiveState=active' in desktop_show_after.stdout_lines"
+                  - "'SubState=running' in desktop_show_after.stdout_lines"
+                  - "('MainPID=' ~ (desktop_pid_before.stdout | trim)) in desktop_show_after.stdout_lines"
+                  - desktop_cgls.stdout is search(desktop_session_proc_re, multiline=True)
+                fail_msg: >-
+                  {{ inventory_hostname }}: {{ 'the unit restarted or stopped within ' ~ desktop_settle_seconds ~ ' s after Xvnc came up ('
+                  ~ (desktop_show_after.stdout_lines | join(', ')) ~ ', main PID was ' ~ (desktop_pid_before.stdout | trim) ~ '); the desktop session exits'
+                  if not ('ActiveState=active' in desktop_show_after.stdout_lines and 'SubState=running' in desktop_show_after.stdout_lines
+                  and ('MainPID=' ~ (desktop_pid_before.stdout | trim)) in desktop_show_after.stdout_lines)
+                  else 'Xvnc runs but no session process (xfce4-session, lxqt-session, mate-session, gnome-session) in the unit' }}.
+                quiet: true
+
+          rescue:
+            # A desktop that fails a security check must not keep running: the socket is open to the group, and the
+            # platform's pod serves it. Stop and disable it before the journal is read.
+            - name: Stop and disable a desktop that failed a security check (owner, mode or a TCP listener)
+              ansible.builtin.systemd_service:
+                name: "{{ desktop_unit }}"
+                state: stopped
+                enabled: false
+              register: desktop_security_stop
+              when: >-
+                ansible_failed_task.name in ['A socket of mode 0660 in the socket group',
+                'The VNC server has no TCP listener']
+
+            - name: The last 30 lines of the unit's journal
+              ansible.builtin.command:
+                argv: [journalctl, -u, "{{ desktop_unit }}", "--no-pager", -n, "30"]
+              register: desktop_journal
+              changed_when: false
+              failed_when: false
+              check_mode: false
+
+            - name: The desktop did not come up
+              ansible.builtin.fail:
+                msg: >-
+                  {{ inventory_hostname }}: {{ ansible_failed_result.msg | default('a check failed') }}
+                  | journalctl -u {{ desktop_unit }} (last 30 lines):
+                  {{ desktop_journal.stdout | default('(no output)') }}
+                  {{ desktop_journal.stderr | default('') | trim }}
+                  | The unit, drop-in and script are in place{{ '; the unit was stopped and disabled'
+                  if desktop_security_stop is not skipped else '' }}; fix what the journal shows and run the playbook
+                  again.
+
+        # -------------------------------------------------------------- report
+        - name: Which session the device runs now
+          ansible.builtin.shell: command -v startxfce4 || command -v startlxqt || command -v mate-session
+          register: desktop_session_after
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          when: not ansible_check_mode
+
+        - name: The TigerVNC server version
+          ansible.builtin.shell: |
+            set -o pipefail
+            for x in Xtigervnc Xvnc; do
+              command -v "$x" >/dev/null 2>&1 || continue
+              out=$("$x" -version 2>&1 </dev/null)
+              line=$(grep -m1 'TigerVNC' <<<"$out") && { printf '%s\n' "$line"; exit 0; }
+            done
+            # TigerVNC 1.15 (Debian 13) prints nothing for -version; report the package instead
+            v=$(dpkg-query -W -f='${Version}' tigervnc-standalone-server 2>/dev/null)
+            [ -n "$v" ] && { echo "TigerVNC $v (tigervnc-standalone-server)"; exit 0; }
+            exit 1
+          args:
+            executable: /bin/bash
+          register: desktop_xvnc
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          when: not ansible_check_mode
+
+        - name: Result
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: desktop running as {{ desktop_user }}, group {{ desktop_group }}/{{ desktop_gid }},
+              session {{ desktop_session_after.stdout | default('') | trim | basename | default('none', true) }},
+              {{ desktop_xvnc.stdout | default('') | trim | default('Xvnc version unknown', true) }};
+              VNC on {{ desktop_socket }} (0660, owner {{ desktop_user }}, group {{ desktop_group }}), Xvnc on no TCP port;
+              next: set spec.desktop {mode: host} on the Device (see README)
+          when: not ansible_check_mode
+
+        - name: Result (check mode)
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: check mode: nothing was installed, started or checked"
+          when: ansible_check_mode
+
+    # ------------------------------------------------------------------ absent
+    - name: Remove the host side of the desktop
+      when: desktop_state == 'absent'
+      block:
+        - name: What is left of the desktop on the device
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ desktop_unit_path }}"
+            - "{{ desktop_dropin_dir }}"
+            - "{{ desktop_session_script }}"
+            - "{{ desktop_runtime_dir }}"
+          register: desktop_absent_stat
+
+        - name: The state before the removal
+          ansible.builtin.set_fact:
+            desktop_absent_any: "{{ desktop_absent_stat.results | map(attribute='stat') | selectattr('exists') | list | length > 0 }}"
+            desktop_absent_unit: >-
+              {{ desktop_absent_stat.results | selectattr('item', 'equalto', desktop_unit_path)
+              | map(attribute='stat') | selectattr('exists') | list | length > 0 }}
+
+        # The cookie belongs to the user the installed unit runs as (the drop-in's User=), whatever -e desktop_user says now.
+        - name: The user the installed unit runs as
+          ansible.builtin.command:
+            argv: [systemctl, show, "{{ desktop_unit }}", --property=User, --value]
+          register: desktop_absent_unit_user
+          changed_when: false
+          check_mode: false
+          when: desktop_absent_unit | bool
+
+        - name: The owner of the X auth cookie
+          ansible.builtin.set_fact:
+            desktop_absent_user: "{{ (desktop_absent_unit_user.stdout | default('') | trim) or desktop_user }}"
+
+        # Only a unit that systemd cannot load, or cannot find, is tolerated: a stop that fails for another reason must
+        # fail the run, or the desktop keeps serving from a unit file that was just deleted.
+        - name: Stop and disable the unit
+          ansible.builtin.systemd_service:
+            name: "{{ desktop_unit }}"
+            state: stopped
+            enabled: false
+          register: desktop_stop
+          failed_when: >-
+            desktop_stop is failed and not ((desktop_stop.msg | default(''))
+            is search('Error loading unit file|Could not find the requested service'))
+          when: desktop_absent_unit | bool
+
+        # The session script writes the display's X auth cookie to $HOME of the unit's User= (desktop_absent_user), after
+        # the stop so that a running session cannot write it again.
+        - name: The home of the desktop user (for its X auth cookie)
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ desktop_absent_user }}"
+            fail_key: false
+          register: desktop_absent_passwd
+
+        - name: Remove the X auth cookie of the desktop session
+          ansible.builtin.file:
+            path: "{{ desktop_absent_passwd.ansible_facts.getent_passwd[desktop_absent_user][4] }}/.teknoir-desktop.Xauthority"
+            state: absent
+          register: desktop_absent_cookie
+          when: (desktop_absent_passwd.ansible_facts.getent_passwd | default({})).get(desktop_absent_user) is not none
+
+        - name: Remove the drop-in
+          ansible.builtin.file:
+            path: "{{ desktop_dropin_dir }}"
+            state: absent
+
+        - name: Remove the unit
+          ansible.builtin.file:
+            path: "{{ desktop_unit_path }}"
+            state: absent
+
+        - name: Remove the session script
+          ansible.builtin.file:
+            path: "{{ desktop_session_script }}"
+            state: absent
+
+        - name: Reload systemd after the unit and the drop-in are gone
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+          when: desktop_absent_any | bool
+
+        - name: Remove the runtime directory (RuntimeDirectoryPreserve keeps it after a stop)
+          ansible.builtin.file:
+            path: "{{ desktop_runtime_dir }}"
+            state: absent
+
+        - name: Read the state of the unit
+          ansible.builtin.systemd_service:
+            name: "{{ desktop_unit }}"
+          register: desktop_after_stop
+          when: not ansible_check_mode
+
+        # A unit that had failed (exit 78) stays listed as failed after its file is gone, and keeps
+        # systemctl is-system-running at "degraded"; clear it.
+        - name: Clear the failed state of the removed unit
+          ansible.builtin.command:
+            argv: [systemctl, reset-failed, "{{ desktop_unit }}.service"]
+          changed_when: true
+          when:
+            - not ansible_check_mode
+            - (desktop_after_stop.status.ActiveState | default('')) == 'failed'
+
+        - name: The desktop no longer runs
+          ansible.builtin.assert:
+            that:
+              - (desktop_after_stop.status.ActiveState | default('inactive')) not in ['active', 'activating', 'deactivating', 'reloading']
+            fail_msg: >-
+              {{ inventory_hostname }}: {{ desktop_unit }} still runs ({{ desktop_after_stop.status.ActiveState | default('?') }})
+              after the removal; stop it with: sudo systemctl stop {{ desktop_unit }}
+            quiet: true
+          when: not ansible_check_mode
+
+        - name: Result
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ 'desktop removed (unit, drop-in, session script, runtime directory, X auth
+              cookie); the packages, the user and the group stay'
+              if (desktop_absent_any | bool or desktop_absent_cookie is changed)
+              else 'desktop was not installed, nothing to remove' }}
+          when: not ansible_check_mode
+
+        - name: Result (check mode)
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: check mode: {{ 'the desktop would be removed (unit, drop-in, session script,
+              runtime directory, X auth cookie)' if (desktop_absent_any | bool or desktop_absent_cookie is changed)
+              else 'the desktop is not installed, nothing to remove' }}; nothing was changed
+          when: ansible_check_mode
+
+  handlers:
+    # Check mode writes no unit file, so a restart would fail for a unit systemd cannot find (see "Enable and start").
+    - name: Restart the desktop unit
+      ansible.builtin.systemd_service:
+        name: "{{ desktop_unit }}"
+        daemon_reload: true
+        state: restarted
+      when: not ansible_check_mode
