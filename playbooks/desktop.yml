@@ -62,8 +62,9 @@
     # present installs and starts; absent stops, disables and removes the unit, the drop-in, the script, the runtime
     # directory and the X auth cookie.
     desktop_state: present
-    # The user whose desktop runs, the socket group (gid 64080 on every device) and the screen size.
-    desktop_user: teknoir
+    # The user whose desktop runs (the device's login user from tnctl's ansible_teknoir_login_user, else teknoir),
+    # the socket group (gid 64080 on every device) and the screen size.
+    desktop_user: "{{ ansible_teknoir_login_user | default('teknoir') }}"
     desktop_group: teknoir-desktop
     desktop_gid: 64080
     desktop_geometry: 1600x900

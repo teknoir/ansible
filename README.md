@@ -359,7 +359,7 @@ A Jetson on JetPack 5 (Ubuntu 20.04, Python 3.8) needs ansible-core 2.19 or olde
 | Variable | Default | |
 | --- | --- | --- |
 | `desktop_state` | `present` | `present` installs and starts; `absent` stops, disables and removes the unit, the drop-in, the script, the runtime directory and the X auth cookie |
-| `desktop_user` | `teknoir` | the user whose desktop runs; it must exist (the run fails with `user <u> does not exist on <host>`), and it must not be root (uid 0): the desktop has no password. A plain user name (`^[a-z_][a-z0-9_-]{0,31}$`), because it goes into the unit's drop-in |
+| `desktop_user` | the device's login user from tnctl (`ansible_teknoir_login_user`), else `teknoir` | the user whose desktop runs; it must exist (the run fails with `user <u> does not exist on <host>`), and it must not be root (uid 0): the desktop has no password. A plain user name (`^[a-z_][a-z0-9_-]{0,31}$`), because it goes into the unit's drop-in |
 | `desktop_group` | `teknoir-desktop` | the socket group; a plain group name (`^[a-z_][a-z0-9_-]{0,31}$`), for the same reason |
 | `desktop_gid` | `64080` | its gid, the same on every device (the platform's pod runs with `supplementalGroups: [64080]`); an integer 1000..65535 |
 | `desktop_geometry` | `1600x900` | the screen size (`^[0-9]{3,4}x[0-9]{3,4}$`) |
@@ -415,15 +415,19 @@ pod can read that directory.
 packages, the user and the group behind (the group's gid is shared with the platform, and another workload may use the
 packages). A second run reports no changes, and it fails rather than report success when the unit still runs after the
 removal.
-**Turn the desktop off on the Device before you remove the host side**:
+**Turn the desktop off on the Device before you remove the host side**: choose **Off** on the device's **Desktop** tab
+(Devices → the device → Configure → Desktop), or use kubectl:
 `kubectl --context <ctx> -n <teamspace> patch device <name> --type merge -p '{"spec":{"desktop":null}}'`. Otherwise the
 platform's pod loses `/run/teknoir-desktop`: it fails its health check and, after a reboot, waits in ContainerCreating
 for the hostPath, while the Device still shows the desktop as `Published`.
 
-**Security model.** There is no VNC password, and host mode hands over the device's own session. Whoever reaches the
-VNC server has a shell as `desktop_user`: XFCE has a terminal, so treat the desktop like SSH. When the platform user
-logs in by key only, it has passwordless sudo (`/etc/sudoers.d/90-teknoir-platform-user`), and the desktop is then
-root on the device. A user with a password can still `sudo` with it. Xvnc listens on no TCP port (`-rfbport -1`,
+**Security model.** There is no VNC password, and host mode hands over the device's own session. Whoever opens a host
+desktop works as the desktop user, usually with `sudo`, and that user's home folder holds the device's own key
+(`~/.ssh/id_rsa`), the key the device signs in to MQTT and SSH with: whoever opens the desktop can copy it and keep
+using it after the desktop is turned off. That is why only a teamspace admin can turn on a host desktop in the portal.
+When the platform user logs in by key only, it has passwordless sudo
+(`/etc/sudoers.d/90-teknoir-platform-user`), and the desktop is then root on the device. A user with a password can
+still `sudo` with it. Xvnc listens on no TCP port (`-rfbport -1`,
 `-nolisten tcp`). Its VNC listener is `/run/teknoir-desktop/vnc.sock`: mode `0660`, owner `desktop_user`, group
 `teknoir-desktop` (gid 64080), in a `0750` directory with the same owner and group. The X display `:7` itself also has
 local sockets, and only its X auth cookie guards them. On the device, the VNC socket can be opened by root, by
@@ -436,15 +440,16 @@ From outside the device, the browser gets there only through Tunneling, after th
 that the user may `create pods/exec` in the teamspace. Turn host mode on only on devices that have no untrusted local
 users and no untrusted host-network workloads.
 
-**Next step: turn the desktop on for the Device in the platform.** The Device object says whether the platform
-injects the pod. Without it nothing outside the device reaches the session, but the unit still starts at every boot
-and runs the desktop session (Xvnc and the session found or installed above) as `desktop_user`. The desktop needs
-Tunneling on the Device (annotation `ztna.teknoir.org/wireguard: enabled`; without it `status.desktop.state` is
-`NeedsTunneling`):
+**Next step: turn the desktop on for the Device in the platform.** A teamspace admin chooses **Host** on the device's
+**Desktop** tab in the portal (Devices → the device → Configure → Desktop; the security model above says why), or with
+kubectl. The Device object says whether the platform injects the pod. Without it nothing outside the device reaches the
+session, but the unit still starts at every boot and runs the desktop session (Xvnc and the session found or installed
+above) as `desktop_user`. The desktop needs Tunneling on the Device (annotation `ztna.teknoir.org/wireguard: enabled`;
+without it `status.desktop.state` is `NeedsTunneling`):
 ```bash
 kubectl --context <ctx> -n <teamspace> patch device <name> --type merge -p '{"spec":{"desktop":{"mode":"host"}}}'
 ```
-(or later in the UI). Check it with
+Check it with
 `kubectl --context <ctx> -n <teamspace> get device <name> -o jsonpath='{.subresources.status.desktop}'`: `state` is
 `Published`, and `url` is set once the Tunneling web gateway serves it. `Published` says the pod was injected, not
 that the host unit works; that is what this playbook's check is for.
