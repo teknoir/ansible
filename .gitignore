@@ -2,3 +2,4 @@ inv
 .idea
 venvtmp/
 __pycache__/
+.test-logs/
