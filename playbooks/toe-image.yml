@@ -18,7 +18,8 @@
 #     node of the robot (another computer, other keys) EMQX refuses it (reason 135) and TOE restart-loops, the robot
 #     goes offline. Before anything is changed it checks that the pod spec is found exactly once (and has no other
 #     nodeSelector) and that `kubectl get nodes -l node-role.kubernetes.io/control-plane=true` returns exactly one
-#     node; after the rollout it asserts that every live TOE pod (not Failed or Succeeded, not being deleted) runs on that node. This also happens when the image is
+#     node; after the rollout it asserts that every live TOE pod (not Failed or Succeeded, not being deleted) runs on
+#     that node. This also happens when the image is
 #     the one the device already has (the run then only adds the selector and rolls the Deployment; the pre-flight
 #     checks below apply to such a run, only a run that changes nothing skips them). -e toe_pin_server=false
 #     leaves the pod template alone,
