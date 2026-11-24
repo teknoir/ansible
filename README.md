@@ -364,38 +364,73 @@ A Jetson on JetPack 5 (Ubuntu 20.04, Python 3.8) needs ansible-core 2.19 or olde
 | `desktop_gid` | `64080` | its gid, the same on every device (the platform's pod runs with `supplementalGroups: [64080]`); an integer 1000..65535 |
 | `desktop_geometry` | `1600x900` | the screen size (`^[0-9]{3,4}x[0-9]{3,4}$`) |
 | `desktop_install_xfce` | `auto` | `auto`: install XFCE (`xfce4`, `xfce4-terminal`) only when none of `startxfce4`, `startlxqt`, `mate-session` is on the PATH (GNOME never counts, not even with `gnome-flashback`: plain GNOME needs a full graphics stack, and the playbook does not look for the flashback session); `true`: always; `false`: never (the run fails when no session is found) |
+| `desktop_theme` | `teknoir` | `teknoir`: install the Teknoir theme of the remote session (see **The theme** below); `none`: install none, and remove a theme an earlier run installed |
+
+The theme has two locations that may be overridden: `desktop_theme_xdg_dir` (default
+`/usr/local/share/teknoir-desktop/xdg`) and `desktop_theme_migrate` (default
+`/usr/local/libexec/teknoir-desktop-theme-migrate`). Both reach the session through the drop-in
+(`TEKNOIR_DESKTOP_THEME_XDG`, `TEKNOIR_DESKTOP_THEME_MIGRATE`), and both must be absolute paths without a trailing
+slash, a space or another control character. Everything else is fixed: the theme directory `/usr/share/themes/Teknoir`,
+the mark `/usr/share/teknoir/teknoir-mark.svg` and the font directory `/usr/local/share/fonts/teknoir` are the paths the
+theme's own files name (the panel references the mark by full path, GTK and xfwm4 only search the standard theme dirs),
+so the run refuses another value, and so are `/usr/share/teknoir` and `/usr/local/share/teknoir-desktop`.
 
 Per device (`serial: 1`):
 1. validates the variables, then refuses a device that is not Debian or Ubuntu, a `desktop_user` that does not exist
    or is root (uid 0), and a socket group or gid that belongs to something else (the name with another gid, or the gid
    with another name) or that has members other than the desktop user and root (in the group, or with gid 64080 as
    their primary group), and a device with no session (`startxfce4`, `startlxqt`, `mate-session`) when
-   `desktop_install_xfce` is `false`. Nothing is changed before those checks pass;
+   `desktop_install_xfce` is `false`; with `desktop_theme=teknoir` it also refuses a vendored bundle that does not match
+   its `SHA256SUMS` (below). Nothing is changed before those checks pass;
 2. creates the group `teknoir-desktop` with gid 64080 when it does not exist;
 3. installs `tigervnc-standalone-server`, `dbus-x11` and `xauth` (the session script needs `xauth` for the X auth
    cookie), and XFCE per `desktop_install_xfce` (without its recommendations);
 4. installs the session script `/usr/local/libexec/teknoir-desktop-session` (root, 0755) and the unit
    `/etc/systemd/system/teknoir-desktop.service` (root, 0644) from `playbooks/files/teknoir-desktop/`, and the
-   drop-in `10-teknoir.conf` (`User`, `Group`, `TEKNOIR_DESKTOP_GROUP`, `TEKNOIR_DESKTOP_GEOMETRY`);
-5. refuses another drop-in of the unit that sets a different `User=` or `Group=` (an `override.conf` from
+   drop-in `10-teknoir.conf` (`User`, `Group`, `TEKNOIR_DESKTOP_GROUP`, `TEKNOIR_DESKTOP_GEOMETRY`,
+   `TEKNOIR_DESKTOP_THEME`, `TEKNOIR_DESKTOP_THEME_XDG`, `TEKNOIR_DESKTOP_THEME_MIGRATE`);
+5. with `desktop_theme=teknoir`, installs `librsvg2-common` (the SVG loader the panel's mark needs),
+   `adwaita-icon-theme` and `fontconfig`, then the GTK3 and xfwm4 theme (`/usr/share/themes/Teknoir`), the mark
+   (`/usr/share/teknoir/teknoir-mark.svg`), the fonts (`/usr/local/share/fonts/teknoir`), the session's xfconf
+   defaults (`/usr/local/share/teknoir-desktop/xdg`) and the one-time migration
+   (`/usr/local/libexec/teknoir-desktop-theme-migrate`, 0755), and removes theme and font files that a newer bundle
+   dropped (the directory copy never deletes; fontconfig's own `.uuid` and `*.cache-*` files in the font directory
+   stay), then runs `fc-cache -f /usr/local/share/fonts` when the fonts changed or one was removed; any change
+   restarts the unit, so the running session picks the theme up. With `desktop_theme=none` it removes those files
+   instead. The run fails before it changes anything on the device when the vendored bundle has no `SOURCE` or
+   `SHA256SUMS`, when it does not match its `SHA256SUMS` (every file listed with that hash, and nothing listed that is
+   not there: otherwise the copy installs what the removal deletes again, on every run), or when `SHA256SUMS` has no
+   `theme/themes/Teknoir/`, `theme/xdg/` and `theme/fonts/` file. The user's own `~/.config` is never touched;
+6. refuses another drop-in of the unit that sets a different `User=` or `Group=` (an `override.conf` from
    `systemctl edit` sorts after `10-teknoir.conf` and wins; checked with `systemctl show` after the files are written,
    before the unit is started or restarted), then enables and starts the unit, and restarts it only when one of those
    files changed or XFCE was just installed (the session script then switches to XFCE), or when the running unit is
-   older than the installed session script, unit or drop-in (a run that stopped before its restart);
-6. checks that the desktop really runs: the socket appears within 30 s, it is a **socket** of mode `0660` owned by
+   older than the installed session script, unit, drop-in or theme files (a run that stopped before its restart);
+7. checks that the desktop really runs: the socket appears within 30 s, it is a **socket** of mode `0660` owned by
    `desktop_user` in group `teknoir-desktop`, `/run/teknoir-desktop` belongs to that group with group search
    permission, the server answers the VNC banner (`RFB `) on the socket (a `python3` probe as root, 12 bytes, 3 s) and
    Xvnc listens on no TCP port (only the unit's own `Xvnc` counts: another VNC server on the device, a
    `tigervncserver :1` on `127.0.0.1:5901` or a RealVNC one, is not this playbook's), and 8 s after the probe the unit
    is still the same process (a session that exits restarts it) and runs a session process (`xfce4-session`,
-   `lxqt-session`, `mate-session` or `gnome-session`). When the socket's owner, group or mode is wrong, or the server
+   `lxqt-session`, `mate-session` or `gnome-session`); with the theme, that `fc-list` knows Hanken Grotesk and
+   JetBrains Mono, and that the session process carries `XDG_CONFIG_DIRS=/usr/local/share/teknoir-desktop/xdg:...` for
+   XFCE or `GTK_THEME=Teknoir` for another session. When the socket's owner, group or mode is wrong, or the server
    listens on TCP, the unit is first stopped and disabled. A failed check prints the last 30 lines of
    `journalctl -u teknoir-desktop` and fails the run;
-7. prints one line: the user, the group and gid, the session, the Xvnc version, and the next step.
+8. prints one line: the user, the group and gid, the session, the Xvnc version, the theme (`full` for XFCE, `GTK only`
+   for another session), and the next step.
 
-The two host files are vendored from `teknoir/teknoir-desktop` (`host/`); do not edit them here, they are refreshed
-from that repo. Everything else is set through the drop-in. Change the user with `-e desktop_user=<user>`, not with an
-`override.conf` as in the unit's comment: the playbook refuses a drop-in that sets another `User=` or `Group=`.
+The bundle in `playbooks/files/teknoir-desktop/` is vendored from `teknoir/teknoir-desktop` (`host/`); do not edit it
+here. Vendor it in a teknoir-desktop checkout at the wanted commit with
+`make host-bundle OUT=<ansible>/playbooks/files/teknoir-desktop`; `SOURCE` there records that commit, and
+`tests/desktop-vendor/run.sh` checks that `SHA256SUMS` covers every file and that the playbook's `src:` paths and the
+panel's mark path agree with it. The playbook checks the controller copy itself too, before it changes anything on the
+device (`sha256sum -c --strict` plus a file-by-file comparison with `SHA256SUMS`), and refuses a bundle that fails, with
+the difference. `tests/desktop-theme-jinja/run.sh` renders the playbook's own expressions for the theme file lists
+with stub `SHA256SUMS` files (empty, CRLF, a `*` marker, a `./` prefix, an overridden location with a trailing slash)
+through ansible's Templar: no device, no network. Everything else is set through the drop-in. Change the user with
+`-e desktop_user=<user>`, not with an `override.conf` as in the unit's comment: the playbook refuses a drop-in that sets
+another `User=` or `Group=`.
 
 **What the unit does.** The session runs as `desktop_user` with primary group `teknoir-desktop`; it is enabled for
 `multi-user.target`, so it starts at every boot. `Restart=always`: when the session exits — a logout, or a crash — the
@@ -409,10 +444,24 @@ own MIT-MAGIC-COOKIE in `~/.teknoir-desktop.Xauthority` of `desktop_user` (mode 
 reaching the X socket is not enough to read the screen; it is outside `/run/teknoir-desktop` on purpose, because the
 pod can read that directory.
 
+**The theme.** With `desktop_theme=teknoir` the remote XFCE session looks like Teknoir: the GTK3 and xfwm4 theme, the
+panel with the Teknoir mark, the terminal palette and the Hanken Grotesk and JetBrains Mono fonts. Another session
+(`startlxqt`, `mate-session`, GNOME) gets `GTK_THEME=Teknoir` only. It is per remote session: the session script exports
+`XDG_CONFIG_DIRS=/usr/local/share/teknoir-desktop/xdg:...` for XFCE and nothing goes into `/etc/xdg` or fontconfig's
+defaults, so the device's other sessions keep their look. The drop-in sets `TEKNOIR_DESKTOP_THEME_XDG` and
+`TEKNOIR_DESKTOP_THEME_MIGRATE` from `desktop_theme_xdg_dir` and `desktop_theme_migrate`, the two locations that may be
+overridden; the theme directory, the mark and the font directory cannot, because the theme's own files name them (and a
+run prunes whatever the bundle does not list under the theme directory and the font directory). The device user's own
+`~/.config/xfce4` is shared with any local XFCE session of that user, and the one-time migration
+(`desktop_theme_migrate`, once per home, marker `~/.config/teknoir/theme-v1`) resets that user's theme keys and panel
+layout; to run it again, delete the marker and restart the unit.
+`-e desktop_theme=none` removes the theme; the user's `~/.config` stays.
+
 `desktop_state=absent` stops and disables the unit and removes the drop-in, the unit, the session script and
 `/run/teknoir-desktop` (which `RuntimeDirectoryPreserve` would otherwise leave behind), and the X auth cookie
-`~/.teknoir-desktop.Xauthority` of the user the unit ran as (read from the unit, so `-e desktop_user` is not needed). It leaves the
-packages, the user and the group behind (the group's gid is shared with the platform, and another workload may use the
+`~/.teknoir-desktop.Xauthority` of the user the unit ran as (read from the unit, so `-e desktop_user` is not needed). It
+also removes the theme files (and runs `fc-cache` again when the fonts go). It leaves the packages, the user, the group
+and the user's `~/.config` behind (the group's gid is shared with the platform, and another workload may use the
 packages). A second run reports no changes, and it fails rather than report success when the unit still runs after the
 removal.
 **Turn the desktop off on the Device before you remove the host side**: choose **Off** on the device's **Desktop** tab
