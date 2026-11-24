@@ -3,3 +3,5 @@ inv
 venvtmp/
 __pycache__/
 .test-logs/
+# make host-bundle in teknoir-desktop stages the bundle next to the out directory; a crashed run can leave one behind
+playbooks/files/.host-bundle*

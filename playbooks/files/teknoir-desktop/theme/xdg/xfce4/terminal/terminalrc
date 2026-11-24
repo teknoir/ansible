@@ -1,0 +1,15 @@
+[Configuration]
+ColorForeground=#F2F1EE
+ColorBackground=#000000
+ColorCursor=#8CA7F2
+ColorCursorUseDefault=FALSE
+ColorSelection=#FFFFFF
+ColorSelectionBackground=#3B61BF
+ColorSelectionUseDefault=FALSE
+ColorBoldIsBright=FALSE
+ColorPalette=#2A2A2A;#FA5A5A;#2BC966;#F5B02E;#6F90EA;#C25BA6;#2BB8C4;#C7C5BF;#8C8C8C;#FC8C8C;#6BD994;#F8C86D;#9AB1F0;#D48CC1;#6BCDD6;#F2F1EE
+FontUseSystem=FALSE
+FontName=JetBrains Mono 10
+ScrollingBar=TERMINAL_SCROLLBAR_NONE
+MiscMenubarDefault=FALSE
+MiscDefaultGeometry=100x30

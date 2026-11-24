@@ -4,3 +4,8 @@ User={{ desktop_user }}
 Group={{ desktop_group }}
 Environment=TEKNOIR_DESKTOP_GROUP={{ desktop_group }}
 Environment=TEKNOIR_DESKTOP_GEOMETRY={{ desktop_geometry }}
+Environment=TEKNOIR_DESKTOP_THEME={{ desktop_theme }}
+# The two paths of the theme the session script takes from the environment (it defaults to the same values): the
+# xfconf defaults it puts in front of XDG_CONFIG_DIRS, and the one-time migration it runs in the user's home.
+Environment=TEKNOIR_DESKTOP_THEME_XDG={{ desktop_theme_xdg_dir }}
+Environment=TEKNOIR_DESKTOP_THEME_MIGRATE={{ desktop_theme_migrate }}
