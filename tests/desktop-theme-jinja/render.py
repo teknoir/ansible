@@ -7,7 +7,9 @@ file, CRLF line endings, a `*` binary marker, a `./` prefix or an overridden loc
 produce paths the device never has. This renders the expressions themselves (read from the playbook, not copied here)
 with ansible's own Templar, so no playbook runs against a host: `run.sh` finds a python that has ansible and calls
 this file with the repository root. The removal's own expression is rendered too, against a stub list of device files,
-to show that it keeps what the copy installs and fontconfig's own `.uuid` and `*.cache-*` files.
+to show that it keeps what the copy installs and fontconfig's own `.uuid` and `*.cache-*` files; so are the two
+expressions of the theme checks (the font a removal dropped, and the XFCE session's XDG_CONFIG_DIRS), which decide
+whether fontconfig is refreshed and whether the session really reads the theme's defaults.
 """
 
 import os
@@ -30,6 +32,8 @@ PLAYBOOK = "playbooks/desktop.yml"
 FILES_TASK = "The files the vendored bundle installs"
 EXPECTED_TASK = "The theme files the bundle installs, where they go on the device"
 STALE_TASK = "Remove theme files that the vendored bundle does not have any more"
+FONTS_TASK = "Make the theme fonts known to fontconfig"
+XDG_TASK = "The XFCE session runs with the Teknoir defaults"
 
 fail = 0
 
@@ -65,6 +69,11 @@ def task_expression(playbook, name, module="ansible.builtin.set_fact", field=Non
 def render(expression, variables):
     templar = Templar(loader=DataLoader(), variables=variables)
     return templar.template(trust_as_template(expression))
+
+
+def as_bool(value):
+    # A whole-expression template renders to a bool with jinja2 native types and to "True"/"False" otherwise.
+    return value is True or value == "True"
 
 
 def bundle_list(files_expr, sums):
@@ -163,6 +172,45 @@ def main():
 
     trailing = expected_list(expected_expr, files, desktop_theme_xdg_dir=XDG_DIR + "/", desktop_theme_fonts_dir=FONTS_DIR + "//")
     ok("a location with a trailing slash keeps one slash", sorted(trailing) == sorted(normal_expected), f"{trailing}")
+
+    # The font test before fc-cache: a font the removal dropped leaves fontconfig's cache stale, a theme file that is
+    # not a font does not, and an unchanged result is not a removal.
+    fonts_expr = task_expression(playbook, FONTS_TASK, field="vars")["desktop_theme_fonts_dropped"]
+
+    def fonts_dropped(results):
+        return as_bool(render(fonts_expr, {"desktop_theme_fonts_dir": FONTS_DIR,
+                                           "desktop_theme_stale": {"results": results}}))
+
+    def stale(item, changed=True):
+        return {"item": item, "changed": changed}
+
+    ok("a dropped font asks fontconfig for a new cache", fonts_dropped([stale(f"{FONTS_DIR}/Dropped-VF.ttf")]))
+    ok("a dropped theme file that is not a font does not",
+       not fonts_dropped([stale(f"{THEME_DIR}/gtk-3.0/gtk.css~")]))
+    ok("a stale result that did not change does not",
+       not fonts_dropped([stale(f"{FONTS_DIR}/Dropped-VF.ttf", changed=False)]))
+    ok("no stale result at all does not", not fonts_dropped([]))
+
+    # The XFCE session check: XDG_CONFIG_DIRS has to start with the theme's xdg directory, and the directory is put
+    # into the pattern through regex_escape, so a dot in it cannot stand for another character.
+    # A `that:` is a bare expression (no {{ }}): assert evaluates it like a when:, so it is templated the same way here.
+    xdg_expr = task_expression(playbook, XDG_TASK, field="ansible.builtin.assert")["that"]
+
+    def xdg_with(xdg_dir, *lines):
+        return as_bool(render("{{ " + xdg_expr + " }}", {
+            "desktop_theme_xdg_dir": xdg_dir,
+            "desktop_theme_env": {"stdout_lines": list(lines)},
+        }))
+
+    ok("the session's XDG_CONFIG_DIRS with the theme first passes",
+       xdg_with(XDG_DIR, "session=xfce pid=42", f"XDG_CONFIG_DIRS={XDG_DIR}:/etc/xdg"))
+    ok("a longer directory name does not pass for the theme's",
+       not xdg_with(XDG_DIR, f"XDG_CONFIG_DIRS={XDG_DIR}2:/etc/xdg"))
+    ok("a session without XDG_CONFIG_DIRS does not pass", not xdg_with(XDG_DIR, "session=xfce pid=42"))
+    dotted = "/usr/local/share/teknoir.d/xdg"
+    ok("the pattern escapes a dot in the location",
+       xdg_with(dotted, f"XDG_CONFIG_DIRS={dotted}:/etc/xdg")
+       and not xdg_with(dotted, "XDG_CONFIG_DIRS=/usr/local/share/teknoirXd/xdg:/etc/xdg"))
 
     # The removal keeps what the copy installs and removes the rest, except fontconfig's own files in the font
     # directory (fc-cache 2.13 on Ubuntu 20.04 writes a .uuid into each font directory, and its caches are *.cache-*).

@@ -2,9 +2,11 @@
 # shellcheck disable=SC2034 # the ok() checks read these through eval, which shellcheck cannot see
 # Local test of the vendored bundle in playbooks/files/teknoir-desktop/, the files playbooks/desktop.yml installs (the
 # session script, the unit and the theme). The bundle comes from teknoir/teknoir-desktop (`make host-bundle OUT=...`)
-# and is never edited here, so this suite checks that it is complete and that the playbook and the bundle agree: every
-# file is in SHA256SUMS and nothing else is, every `src:` of the playbook exists, the panel references the mark path the
-# playbook installs it to, and both sides know the theme switch. No device, no network, no root.
+# and is never edited here, so this suite checks that it is complete and that the playbook and the bundle agree: the
+# bundle passes playbooks/files/desktop_bundle_check.py, the check the playbook itself runs on the controller (every
+# file in SHA256SUMS, nothing else, the three theme trees; tests/desktop-bundle-check proves the script reports each
+# kind of problem), every `src:` of the playbook exists, the panel references the mark path the playbook installs it
+# to, and both sides know the theme switch. No device, no network, no root.
 # Usage: tests/desktop-vendor/run.sh
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -24,15 +26,15 @@ ok "SOURCE names the repo" "[ \"\$source_repo\" = teknoir/teknoir-desktop ]"
 ok "SOURCE has a full commit sha" "printf '%s' \"\$source_commit\" | grep -qxE '[0-9a-f]{40}'"
 ok "SOURCE was not vendored from a dirty checkout" "! grep -qE '^dirty: *true' '$bundle/SOURCE' 2>/dev/null"
 
-# SHA256SUMS covers every file in the bundle, and every file it lists is there with that hash. SHA256SUMS cannot list
-# itself, and SOURCE is optional in it (it records the commit, not the content), so both sides leave SOURCE out.
-ok "SHA256SUMS exists" "[ -f '$bundle/SHA256SUMS' ]"
-ok "every file matches SHA256SUMS" "(cd '$bundle' && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1)"
-files=$(cd "$bundle" && find . -type f ! -name SHA256SUMS ! -name SOURCE | sed -E 's|^\./||' | sort)
-listed=$(sed -nE 's/^[0-9a-f]{64} [ *]//p' "$bundle/SHA256SUMS" 2>/dev/null | sed -E 's|^\./||' \
-  | grep -vxE 'SOURCE|SHA256SUMS' | sort)
-ok "SHA256SUMS lists every file of the bundle" "[ -z \"\$(comm -23 <(printf '%s\n' \"\$files\") <(printf '%s\n' \"\$listed\"))\" ]"
-ok "every file SHA256SUMS lists is in the bundle" "[ -z \"\$(comm -13 <(printf '%s\n' \"\$files\") <(printf '%s\n' \"\$listed\"))\" ]"
+# The bundle check the playbook runs is the same script, so CI tests the code the playbook runs: every file in the
+# bundle is in SHA256SUMS with that hash, nothing else is in the folder, and the theme carries its three trees. Its
+# output ("ok <n> files") is the line this suite prints on success.
+check=playbooks/files/desktop_bundle_check.py
+ok "the playbook runs this check on the bundle" "grep -q 'files/desktop_bundle_check.py' '$playbook'"
+bundle_rc=0
+bundle_check=$(python3 -I "$check" "$bundle" 2>&1) || bundle_rc=$?
+ok "the bundle passes desktop_bundle_check.py: $bundle_check" \
+  "[ \"\$bundle_rc\" -eq 0 ] && printf '%s' \"\$bundle_check\" | grep -qxE 'ok [0-9]+ files'"
 
 # Every src: under files/teknoir-desktop that the playbook copies (a plain path, or {{ desktop_files }}) exists in the
 # bundle: the playbook can only install what was vendored.

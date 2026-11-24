@@ -5,7 +5,8 @@
 # Tunneling. Xvnc listens on no TCP port (the platform's pod serves the session on TCP 6080; README "Security model").
 # The host files and the theme are vendored from teknoir/teknoir-desktop (host/) as a bundle in files/teknoir-desktop/
 # (SOURCE, SHA256SUMS, the session script, the unit, theme/) and must not be edited here; the settings go into a systemd
-# drop-in, and tests/desktop-vendor/run.sh checks the bundle, as does this playbook before it changes anything.
+# drop-in, and both tests/desktop-vendor/run.sh and this playbook, before it changes anything, check the bundle with
+# files/desktop_bundle_check.py.
 # README: "Remote desktop (host mode)".
 #
 # What it does, per device (serial 1, one device at a time):
@@ -32,11 +33,13 @@
 #      (/usr/local/share/teknoir-desktop/xdg) and the one-time migration of the user's xfconf copies
 #      (/usr/local/libexec/teknoir-desktop-theme-migrate), and removes theme and font files that a newer bundle no
 #      longer has (fontconfig's own .uuid and *.cache-* files in the font directory stay); desktop_theme=none removes
-#      all of it instead. The theme directory, the mark and the font directory are fixed, because the theme's own files
-#      name exactly those paths, and so are /usr/share/teknoir and /usr/local/share/teknoir-desktop: only the xfconf
-#      directory (desktop_theme_xdg_dir) and the migration path (desktop_theme_migrate) may be overridden, and the
-#      drop-in hands them to the session script (TEKNOIR_DESKTOP_THEME_XDG, TEKNOIR_DESKTOP_THEME_MIGRATE), which
-#      reads the two from the environment. The files are system-wide, but only the remote session selects them: the
+#      all of it instead, and the mark's directory /usr/share/teknoir only when nothing else is left in it. Every theme
+#      location is fixed, because the theme's own files name exactly those paths and the removal deletes whatever the
+#      bundle does not list under the theme directory, the font directory and the session defaults: a path an operator
+#      could override (-e desktop_theme_xdg_dir=/etc/xdg) would turn the removal into "delete the rest of /etc/xdg as
+#      root". The drop-in still hands the xfconf directory and the migration path to the session script
+#      (TEKNOIR_DESKTOP_THEME_XDG, TEKNOIR_DESKTOP_THEME_MIGRATE), whose own overrides exist for its tests. The files
+#      are system-wide, but only the remote session selects them: the
 #      session script exports XDG_CONFIG_DIRS (the theme's xdg directory) for an XFCE session and GTK_THEME for another
 #      session, so nothing in /etc/xdg or in fontconfig's defaults changes. The migration resets the theme keys and the
 #      panel layout of the device user's own ~/.config/xfce4 once (marker ~/.config/teknoir/theme-v1), which a local
@@ -59,9 +62,10 @@
 #
 # desktop_state=absent stops and disables the unit, removes the drop-in, the unit, the session script, the runtime
 # directory, the X auth cookie (~/.teknoir-desktop.Xauthority of the user the unit runs as, read from the unit, so
-# -e desktop_user is not needed) and the theme files (which also re-registers the fonts with fc-cache), and leaves the
-# packages, the user, the group and the user's ~/.config behind. A second run reports no changes; it fails, instead of
-# reporting success, when the unit still runs after the removal.
+# -e desktop_user is not needed) and the theme files (which also re-registers the fonts with fc-cache; the mark's
+# directory /usr/share/teknoir goes only when nothing else is left in it), and leaves the packages, the user, the group
+# and the user's ~/.config behind. A second run reports no changes; it fails, instead of reporting success, when the
+# unit still runs after the removal.
 #
 # --limit is required: the playbook refuses to run without it.
 #
@@ -114,11 +118,11 @@
     desktop_socket: "{{ desktop_runtime_dir }}/vnc.sock"
     # The vendored bundle, and where the theme goes: the GTK3 and xfwm4 theme, the mark the panel references
     # (default.xml names exactly this path), the fonts (fontconfig reads /usr/local/share/fonts), the xfconf defaults of
-    # the remote session (its XDG_CONFIG_DIRS) and the one-time migration of the user's own xfconf copies. The theme
-    # directory, the mark, the font directory and the two directories above the theme root are fixed - the theme's own
-    # files name those paths, and a run prunes what the bundle does not list under the theme directory and the font
-    # directory - so only desktop_theme_xdg_dir and desktop_theme_migrate may be overridden; both reach the session
-    # through the drop-in (TEKNOIR_DESKTOP_THEME_XDG, TEKNOIR_DESKTOP_THEME_MIGRATE).
+    # the remote session (its XDG_CONFIG_DIRS) and the one-time migration of the user's own xfconf copies. Every one of
+    # those paths is fixed - the theme's own files name them, and a run prunes what the bundle does not list under the
+    # theme directory, the font directory and the session defaults - so none may be overridden; the xfconf directory
+    # and the migration still reach the session through the drop-in (TEKNOIR_DESKTOP_THEME_XDG,
+    # TEKNOIR_DESKTOP_THEME_MIGRATE).
     desktop_files: files/teknoir-desktop
     desktop_theme_dir: /usr/share/themes/Teknoir
     desktop_theme_mark: /usr/share/teknoir/teknoir-mark.svg
@@ -127,22 +131,20 @@
     desktop_theme_root: /usr/local/share/teknoir-desktop
     desktop_theme_xdg_dir: "{{ desktop_theme_root }}/xdg"
     desktop_theme_migrate: /usr/local/libexec/teknoir-desktop-theme-migrate
-    desktop_theme_dirs:
+    # What a removal deletes: the theme, the mark (a file; its directory goes only when nothing else is left in it),
+    # the fonts, the session defaults and the migration.
+    desktop_theme_paths:
       - "{{ desktop_theme_dir }}"
-      - "{{ desktop_theme_mark_dir }}"
+      - "{{ desktop_theme_mark }}"
       - "{{ desktop_theme_fonts_dir }}"
       - "{{ desktop_theme_root }}"
-    desktop_theme_paths: "{{ desktop_theme_dirs + [desktop_theme_migrate] }}"
+      - "{{ desktop_theme_migrate }}"
     # Seconds to wait for the socket after the unit was (re)started, and the patterns of the geometry and of a name
-    # that goes into the drop-in (a newline or "=" in it would inject unit directives), of an absolute path without a
-    # trailing slash, and of a character that is not printable ASCII (a newline or another control character in a path
-    # would inject unit directives too; '[^ -~]' is everything from a space to a tilde left out, and the templates
-    # cannot spell a real "\n", see the comment at the bundle's SHA256SUMS below).
+    # that goes into the drop-in (a newline or "=" in it would inject unit directives). The theme locations need no
+    # pattern: they are fixed below.
     desktop_socket_timeout: 30
     desktop_geometry_re: '^[0-9]{3,4}x[0-9]{3,4}$'
     desktop_name_re: '^[a-z_][a-z0-9_-]{0,31}$'
-    desktop_path_re: '^/[^ ]*[^/]$'
-    desktop_path_bad_re: '[^ -~]'
     # Seconds the unit must stay the same process after the probe (a session that exits restarts the unit), and what a
     # session process looks like in systemd-cgls.
     desktop_settle_seconds: 8
@@ -162,6 +164,10 @@
       ansible.builtin.set_fact:
         desktop_install_xfce_norm: "{{ desktop_install_xfce | string | lower }}"
 
+    # Every theme location is fixed, not only checked for its shape: the removal below deletes everything under the
+    # theme directory, the font directory and the session defaults that the bundle does not list, so a free
+    # desktop_theme_xdg_dir (-e desktop_theme_xdg_dir=/etc/xdg, or the user's ~/.config) would have it delete the rest
+    # of that directory as root.
     - name: Validate the variables
       ansible.builtin.assert:
         that:
@@ -177,38 +183,28 @@
           - desktop_gid | string is match('^[0-9]{1,5}$')
           - desktop_gid | int >= 1000
           - desktop_gid | int <= 65535
-          - desktop_theme_dir is match(desktop_path_re)
-          - desktop_theme_mark is match(desktop_path_re)
-          - desktop_theme_mark_dir is match(desktop_path_re)
-          - desktop_theme_fonts_dir is match(desktop_path_re)
-          - desktop_theme_root is match(desktop_path_re)
-          - desktop_theme_xdg_dir is match(desktop_path_re)
-          - desktop_theme_migrate is match(desktop_path_re)
-          - desktop_theme_dir is not search(desktop_path_bad_re)
-          - desktop_theme_mark is not search(desktop_path_bad_re)
-          - desktop_theme_mark_dir is not search(desktop_path_bad_re)
-          - desktop_theme_fonts_dir is not search(desktop_path_bad_re)
-          - desktop_theme_root is not search(desktop_path_bad_re)
-          - desktop_theme_xdg_dir is not search(desktop_path_bad_re)
-          - desktop_theme_migrate is not search(desktop_path_bad_re)
           - desktop_theme_dir == '/usr/share/themes/Teknoir'
           - desktop_theme_mark == '/usr/share/teknoir/teknoir-mark.svg'
           - desktop_theme_mark_dir == '/usr/share/teknoir'
           - desktop_theme_fonts_dir == '/usr/local/share/fonts/teknoir'
           - desktop_theme_root == '/usr/local/share/teknoir-desktop'
+          - desktop_theme_xdg_dir == desktop_theme_root ~ '/xdg'
+          - desktop_theme_migrate == '/usr/local/libexec/teknoir-desktop-theme-migrate'
         fail_msg: >-
           {{ inventory_hostname }}: desktop_state must be present or absent (is {{ desktop_state }}), desktop_install_xfce
           auto, true or false (is {{ desktop_install_xfce }}), desktop_theme teknoir or none (is {{ desktop_theme }}),
           desktop_user a user name (is {{ desktop_user }}),
           desktop_group a group name (is {{ desktop_group }}), desktop_geometry <width>x<height> with 3 or 4 digits each
-          (is {{ desktop_geometry }}), desktop_gid a number 1000..65535 (is {{ desktop_gid }}). The theme locations are
-          absolute paths without a trailing slash, a space or another control character (they go into the drop-in and
-          into the shell: a newline would inject unit directives), the theme directory is
-          /usr/share/themes/Teknoir (is {{ desktop_theme_dir }}), the mark /usr/share/teknoir/teknoir-mark.svg
-          (is {{ desktop_theme_mark }}), the font directory /usr/local/share/fonts/teknoir (is
-          {{ desktop_theme_fonts_dir }}), the theme root /usr/local/share/teknoir-desktop (is
-          {{ desktop_theme_root }}): the theme's own files name exactly those paths, so only desktop_theme_xdg_dir and
-          desktop_theme_migrate may be overridden. Nothing was changed.
+          (is {{ desktop_geometry }}), desktop_gid a number 1000..65535 (is {{ desktop_gid }}). Every theme location is
+          fixed: /usr/share/themes/Teknoir (is {{ desktop_theme_dir }}), the mark /usr/share/teknoir/teknoir-mark.svg
+          (is {{ desktop_theme_mark }}), /usr/share/teknoir (is {{ desktop_theme_mark_dir }}), the font directory
+          /usr/local/share/fonts/teknoir (is {{ desktop_theme_fonts_dir }}), the theme root
+          /usr/local/share/teknoir-desktop (is {{ desktop_theme_root }}), the session defaults
+          /usr/local/share/teknoir-desktop/xdg (is {{ desktop_theme_xdg_dir }}) and the migration
+          /usr/local/libexec/teknoir-desktop-theme-migrate (is {{ desktop_theme_migrate }}). The theme's own files name
+          exactly those paths, and a run removes everything under the theme directory, the font directory and the
+          session defaults that the bundle does not list: a free location would let one override delete the rest of
+          that directory as root. The session script's own overrides exist for its tests. Nothing was changed.
         quiet: true
 
     # ------------------------------------------------------------------ present
@@ -351,27 +347,50 @@
 
         # The theme comes from the vendored bundle, on the controller, and the stale-file removal reads its SHA256SUMS:
         # a clone without it (a bundle that was never vendored, an archive without files/) fails here, before anything
-        # on the device changes.
-        - name: The vendored bundle on the controller
-          ansible.builtin.stat:
-            path: "{{ playbook_dir }}/{{ desktop_files }}/{{ item }}"
-          loop: [SOURCE, SHA256SUMS]
-          register: desktop_bundle_stat
+        # on the device changes. files/desktop_bundle_check.py is the check tests/desktop-vendor and
+        # tests/desktop-bundle-check run too, and it is Python because the controller may be macOS, which has no
+        # sha256sum and whose find has no -printf. ansible_playbook_python is the controller's own interpreter; -I keeps
+        # the working directory and the environment out of it.
+        - name: Check the vendored bundle against its SHA256SUMS
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - -I
+              - "{{ playbook_dir }}/files/desktop_bundle_check.py"
+              - "{{ playbook_dir }}/{{ desktop_files }}"
           delegate_to: localhost
           become: false
+          changed_when: false
           check_mode: false
+          failed_when: false
+          register: desktop_bundle_check
           when: desktop_theme == 'teknoir'
 
-        - name: Refuse to install the theme without the vendored bundle
+        # The script prints one problem per line, with the kind first: missing (a file the list has is not there, or
+        # SOURCE or SHA256SUMS itself), changed (another hash), malformed (a line that is not "<64 hex>  <path>"),
+        # unknown path (not a path the playbook installs), no entries under (a theme tree the list is empty for) and
+        # not in SHA256SUMS (a file in the bundle folder the list does not have). Only the last is fixed by deleting;
+        # everything else means the bundle is not what its SOURCE says, so it is vendored again.
+        - name: Refuse a vendored bundle that does not match its SHA256SUMS
           ansible.builtin.assert:
-            that: (desktop_bundle_stat.results | rejectattr('stat.exists') | list | length) == 0
+            that: (desktop_bundle_check.rc | default(1)) == 0
             fail_msg: >-
-              {{ inventory_hostname }}: {{ desktop_files }} on this machine is missing
-              {{ desktop_bundle_stat.results | rejectattr('stat.exists') | map(attribute='item') | join(' and ') }}
-              and desktop_theme is {{ desktop_theme }}; the theme files come from the vendored bundle. Vendor it with
-              `make host-bundle OUT=<ansible>/{{ desktop_files }}` in a teknoir-desktop checkout at the wanted commit,
-              or pass -e desktop_theme=none. Nothing was changed.
+              {{ inventory_hostname }}: {{ desktop_files }} on this machine is not the bundle its SHA256SUMS describes,
+              so the copy and the removal of stale theme files would undo each other on every run (exit
+              {{ desktop_bundle_check.rc | default('?') }}): {{ desktop_bundle_problems | join(' | ') }}
+              {{ ('Delete the files that are not in SHA256SUMS (git clean -n playbooks/files/teknoir-desktop shows
+              them; a .DS_Store from Finder is one). ' if desktop_bundle_stray else '')
+              ~ ('Vendor the bundle again with `make host-bundle OUT=$PWD/playbooks/files/teknoir-desktop` in a
+              teknoir-desktop checkout at the wanted commit.' if desktop_bundle_other else '') }}
+              Nothing was changed.
             quiet: true
+          vars:
+            desktop_bundle_problems: >-
+              {{ (desktop_bundle_check.stdout_lines | default([])) + (desktop_bundle_check.stderr_lines | default([]))
+              + ([desktop_bundle_check.msg] if not (desktop_bundle_check.stdout_lines | default([])
+              or desktop_bundle_check.stderr_lines | default([])) and desktop_bundle_check.msg | default('') else []) }}
+            desktop_bundle_stray: "{{ desktop_bundle_problems | select('match', '^not in SHA256SUMS: ') | list }}"
+            desktop_bundle_other: "{{ desktop_bundle_problems | reject('match', '^not in SHA256SUMS: ') | list }}"
           when: desktop_theme == 'teknoir'
 
         # What the bundle installs is what its SHA256SUMS lists (paths relative to the bundle, theme/... as vendored).
@@ -397,67 +416,6 @@
               | map('regex_replace', '^theme/xdg/', (desktop_theme_xdg_dir | regex_replace('/+$', '')) ~ '/') | list)
               + (desktop_bundle_files | select('match', '^theme/fonts/')
               | map('regex_replace', '^theme/fonts/', (desktop_theme_fonts_dir | regex_replace('/+$', '')) ~ '/') | list) }}
-          when: desktop_theme == 'teknoir'
-
-        # The stale-file removal keeps exactly the expected list, but the directory copies install whatever is in the
-        # bundle folder: the two have to agree, or every run copies a stray file (gtk.css~, *.orig) and removes it
-        # again - a change and a restart each time, which drops the live remote session - and an empty or foreign
-        # SHA256SUMS would have the removal delete every theme file right after the copy put it there. SOURCE and
-        # SHA256SUMS itself are left out of both lists, as in tests/desktop-vendor/run.sh: SHA256SUMS cannot list
-        # itself, and SOURCE only records the commit.
-        - name: Check the vendored bundle against its SHA256SUMS
-          ansible.builtin.shell: |
-            set -o pipefail
-            sha256sum -c --quiet --strict SHA256SUMS || exit 1
-            listed=$(sed -nE 's/^[0-9a-f]{64} [ *]//p' SHA256SUMS | sed -E 's|^\./||' \
-              | grep -vxE 'SOURCE|SHA256SUMS' | sort)
-            found=$(find . -type f ! -name SHA256SUMS ! -name SOURCE -printf '%P\n' | sort)
-            [ "$listed" = "$found" ] && exit 0
-            echo "in the bundle but not in SHA256SUMS:"
-            comm -13 <(printf '%s\n' "$listed") <(printf '%s\n' "$found")
-            echo "in SHA256SUMS but not in the bundle:"
-            comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$found")
-            exit 1
-          args:
-            executable: /bin/bash
-            chdir: "{{ playbook_dir }}/{{ desktop_files }}"
-          register: desktop_bundle_check
-          changed_when: false
-          check_mode: false
-          delegate_to: localhost
-          become: false
-          when: desktop_theme == 'teknoir'
-
-        - name: Refuse a vendored bundle that does not match its SHA256SUMS
-          ansible.builtin.assert:
-            that: desktop_bundle_check.rc == 0
-            fail_msg: >-
-              {{ inventory_hostname }}: {{ desktop_files }} on this machine does not match its SHA256SUMS, so the copy
-              and the removal of stale theme files would undo each other on every run:
-              {{ desktop_bundle_check.stdout_lines | default([]) | join(' | ') }}
-              Re-vendor the bundle with `make host-bundle OUT=$PWD/playbooks/files/teknoir-desktop` in a
-              teknoir-desktop checkout at the wanted commit. Nothing was changed.
-            quiet: true
-          when: desktop_theme == 'teknoir'
-
-        # A bundle without one of the three theme trees (an older bundle, an out filter in make host-bundle) would
-        # install the theme and let the removal delete it again, so the expected list must have all three.
-        - name: Refuse a vendored bundle without the theme
-          ansible.builtin.assert:
-            that:
-              - desktop_theme_expected
-                | select('match', '^' ~ (desktop_theme_dir | regex_replace('/+$', '')) ~ '/') | list | length > 0
-              - desktop_theme_expected
-                | select('match', '^' ~ (desktop_theme_xdg_dir | regex_replace('/+$', '')) ~ '/') | list | length > 0
-              - desktop_theme_expected
-                | select('match', '^' ~ (desktop_theme_fonts_dir | regex_replace('/+$', '')) ~ '/') | list | length > 0
-            fail_msg: >-
-              {{ inventory_hostname }}: {{ desktop_files }} on this machine has no theme files for the theme directory
-              ({{ desktop_theme_dir }}), the XFCE defaults ({{ desktop_theme_xdg_dir }}) and the fonts
-              ({{ desktop_theme_fonts_dir }}) together: {{ desktop_bundle_files | join(', ') }}. The theme needs all
-              three. Re-vendor the bundle with `make host-bundle OUT=$PWD/playbooks/files/teknoir-desktop` in a
-              teknoir-desktop checkout at the wanted commit. Nothing was changed.
-            quiet: true
           when: desktop_theme == 'teknoir'
 
         # -------------------------------------------------------------- changes
@@ -666,6 +624,23 @@
                 - desktop_theme_removed.results | selectattr('item', 'equalto', desktop_theme_fonts_dir)
                   | selectattr('changed') | list | length > 0
                 - not ansible_check_mode
+
+            # /usr/share/teknoir holds the mark and nothing else this playbook installs, but another package may put a
+            # file there: the directory goes only when this removal is what empties it.
+            - name: What is left in the mark's directory
+              ansible.builtin.find:
+                paths: "{{ desktop_theme_mark_dir }}"
+                file_type: any
+                hidden: true
+              register: desktop_mark_dir_left
+              check_mode: false
+
+            - name: Remove the mark's directory when it is empty
+              ansible.builtin.file:
+                path: "{{ desktop_theme_mark_dir }}"
+                state: absent
+              when: desktop_mark_dir_left.matched | default(1) == 0
+              notify: Restart the desktop unit
 
         - name: Create the drop-in directory
           ansible.builtin.file:
@@ -1003,6 +978,39 @@
                 quiet: true
               when: desktop_theme == 'teknoir'
 
+            # XDG_CONFIG_DIRS is only half of it: the one-time migration that resets the user's own xfconf copies is
+            # skipped while a local XFCE session of that user runs (its xfconfd would write the old values back), and
+            # a migration that fails only logs it. Either way the remote session runs the theme, but the panel may keep
+            # the old layout until the migration runs. The journal of the unit's current start says which; nothing
+            # fails on it, the Result names it and a warning says what to do. The lines are read into a variable, not
+            # with grep -q, so pipefail cannot turn a missing journal into a failure.
+            - name: What the unit's journal says about the theme migration
+              ansible.builtin.shell: |
+                set -o pipefail
+                inv=$(systemctl show -p InvocationID --value {{ desktop_unit }})
+                [ -n "$inv" ] || exit 0
+                journal=$(journalctl -u {{ desktop_unit }} --no-pager -o cat "_SYSTEMD_INVOCATION_ID=$inv" 2>/dev/null) || exit 0
+                pending=$(printf '%s\n' "$journal" | grep -E 'migration waits|theme migration failed' || true)
+                printf '%s\n' "$pending"
+              args:
+                executable: /bin/bash
+              register: desktop_theme_journal
+              changed_when: false
+              failed_when: false
+              check_mode: false
+              when: desktop_theme == 'teknoir'
+
+            - name: What the theme migration of the running session has not done
+              ansible.builtin.set_fact:
+                desktop_theme_pending: >-
+                  {{ ('a local XFCE session of this user is running, and its xfconfd would write the old panel back;
+                  log out of that session, then sudo systemctl restart ' ~ desktop_unit)
+                  if (desktop_theme_journal.stdout | default('')) is search('migration waits')
+                  else ('the migration failed, so the copies in the home of the user still win over the theme
+                  defaults; journalctl -u ' ~ desktop_unit ~ ' shows why'
+                  if (desktop_theme_journal.stdout | default('')) is search('theme migration failed') else '') }}
+              when: desktop_theme == 'teknoir'
+
           rescue:
             # A desktop that fails a security check must not keep running: the socket is open to the group, and the
             # platform's pod serves it. Stop and disable it before the journal is read.
@@ -1072,13 +1080,26 @@
             - not ansible_check_mode
             - desktop_theme == 'teknoir'
 
+        # Not a failure: the desktop runs, and the migration retries at every start of the unit.
+        - name: The theme migration of the running session has not run (warning)
+          ansible.builtin.debug:
+            msg: >-
+              WARNING {{ inventory_hostname }}: the desktop runs with the Teknoir theme, but its one-time migration of
+              the user's own xfconf copies has not completed: {{ desktop_theme_pending }}. Until it runs the panel may
+              keep the layout and the theme keys the user's ~/.config/xfce4 already had.
+          when:
+            - not ansible_check_mode
+            - desktop_theme == 'teknoir'
+            - desktop_theme_pending | default('') | length > 0
+
         - name: Result
           ansible.builtin.debug:
             msg: >-
               {{ inventory_hostname }}: desktop running as {{ desktop_user }}, group {{ desktop_group }}/{{ desktop_gid }},
               session {{ desktop_session_after.stdout | default('') | trim | basename | default('none', true) }},
               {{ desktop_xvnc.stdout | default('') | trim | default('Xvnc version unknown', true) }},
-              theme {{ desktop_theme }}{{ '' if desktop_theme == 'none' else ' (' ~ desktop_theme_mode ~ ')' }};
+              theme {{ desktop_theme }}{{ '' if desktop_theme == 'none' else ' (' ~ desktop_theme_mode ~
+              (', migration pending: ' ~ desktop_theme_pending if desktop_theme_pending | default('') else '') ~ ')' }};
               VNC on {{ desktop_socket }} (0660, owner {{ desktop_user }}, group {{ desktop_group }}), Xvnc on no TCP port;
               next: set spec.desktop {mode: host} on the Device (see README)
           when: not ansible_check_mode
@@ -1191,6 +1212,21 @@
             - desktop_theme_stat.results | selectattr('item', 'equalto', desktop_theme_fonts_dir)
               | selectattr('stat.exists') | list | length > 0
             - not ansible_check_mode
+
+        # The mark's directory is another package's as much as this playbook's: it goes only when nothing else is in it.
+        - name: What is left in the mark's directory
+          ansible.builtin.find:
+            paths: "{{ desktop_theme_mark_dir }}"
+            file_type: any
+            hidden: true
+          register: desktop_mark_dir_left
+          check_mode: false
+
+        - name: Remove the mark's directory when it is empty
+          ansible.builtin.file:
+            path: "{{ desktop_theme_mark_dir }}"
+            state: absent
+          when: desktop_mark_dir_left.matched | default(1) == 0
 
         - name: Reload systemd after the unit and the drop-in are gone
           ansible.builtin.systemd_service:
